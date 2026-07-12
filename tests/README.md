@@ -119,6 +119,11 @@ rounding (which isn't the kernel's job).
   inherent floor, since the kernel returns bf16). Expect `maxAbs` a few×1e-3, well under the
   2e-2 tolerance. (A bf16-vs-*fp32-original-input* comparison would instead be ~1e-2 — that
   extra gap is the input rounding, not a kernel error.)
+- **`(info) vs production-eager(bf16)`** (not gated) — how far the kernel is from the torch
+  eager op run at bf16, i.e. the drop-in-replacement delta. It's ~1e-2 **because eager-bf16
+  rounds QK to bf16** (`einsum(bf16,bf16)->bf16`) while the kernel keeps fp32 QK accumulation
+  — so this gap is mostly eager-bf16's own imprecision; the kernel is ~2× closer to the fp32
+  truth. Against a fused fp32-QK production op (e.g. vllm_ascend SAS) the delta would be ~1e-3.
 - `[sink0]` confirms `sink -> -inf` collapses to plain windowed softmax; `[sinkE]` confirms
   a finite sink actually changes the output.
 

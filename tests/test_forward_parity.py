@@ -70,6 +70,19 @@ def _row(tag, dt, o, ref, atol, rtol):
     return close
 
 
+def _prod_info(o, ref_prod, dt):
+    """INFORMATIONAL (not gated): triton vs the PRODUCTION eager op run at the SAME dtype.
+    Production torch-eager rounds QK to `dt` (einsum(bf16,bf16)->bf16); the triton kernel keeps
+    fp32 QK accumulation, so this gap is mostly eager-bf16's own imprecision — triton is closer
+    to the fp32 truth. Skipped for fp32 (there production eager == the fp32 reference)."""
+    if dt == torch.float32:
+        return
+    d = (o.float() - ref_prod.float()).abs()
+    print(f"    (info) vs production-eager({str(dt).replace('torch.','')}): "
+          f"maxAbs={d.max().item():.2e}  meanRel={(d / (ref_prod.abs() + 1e-6)).mean().item():.2e}"
+          f"  [eager rounds QK to {str(dt).replace('torch.','')}; triton keeps fp32 QK]")
+
+
 def run_windowed(tag, B, H, L, D, wl, wr, *, mla=False, block_m=32, block_n=32):
     """Windowed self-attention vs eager swa_sink_attention (MHA or MLA-shared K/V).
 
@@ -98,6 +111,10 @@ def run_windowed(tag, B, H, L, D, wl, wr, *, mla=False, block_m=32, block_n=32):
             print(f"  [{str(dt).replace('torch.',''):8}] KERNEL RAISED: {type(e).__name__}: {str(e)[:60]}")
             ok = False; continue
         ok &= _row(tag, dt, o, ref, atol, rtol)
+        if dt != torch.float32:   # production eager AT this dtype (bf16 in -> bf16 out, rounds QK)
+            ref_prod = swa_sink_attention(qd, kd, vd, sink, wl, wr, scale=scale,
+                                          compute_dtype=torch.float32)
+            _prod_info(o, ref_prod, dt)
     return ok
 
 
@@ -140,6 +157,10 @@ def run_gold(tag, N, BS, KV, H, D, *, mla=False, block_m=16, block_n=16):
             print(f"  [{str(dt).replace('torch.',''):8}] KERNEL RAISED: {type(e).__name__}: {str(e)[:60]}")
             ok = False; continue
         ok &= _row(tag, dt, o.permute(0, 2, 1, 3), gold, atol, rtol)   # -> [N,BS,H,D]
+        if dt != torch.float32:   # production gold run AT this dtype (rounds QK to dt)
+            gold_prod = dspark_block_attention_ref(qg_d, kg_ref.to(dt), vg_ref.to(dt), sink,
+                                                   scale=scale, compute_dtype=torch.float32)
+            _prod_info(o.permute(0, 2, 1, 3), gold_prod, dt)
     return ok
 
 
