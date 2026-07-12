@@ -37,7 +37,9 @@ import torch
 import triton
 import triton.language as tl
 
-LOG2E = 1.4426950408889634  # 1/ln(2); folds exp(x) into exp2(x*LOG2E)
+# 1/ln(2); folds exp(x) into exp2(x*LOG2E). Must be a tl.constexpr: Triton >=3.x forbids
+# @jit kernels from reading plain module globals (only constexpr globals are allowed).
+LOG2E = tl.constexpr(1.4426950408889634)
 
 
 @triton.jit
@@ -72,7 +74,9 @@ def _swa_sink_fwd_kernel(
 
     # ---- seed the online softmax WITH THE SINK as a virtual key ----
     sink_val = tl.load(Sink + h).to(tl.float32)      # per-head fp32 scalar, RAW (unscaled)
-    m_i = tl.full([BLOCK_M], sink_val * LOG2E, dtype=tl.float32)   # running max incl. sink
+    # seed as a virtual key: m = sink*log2e, l = 1 (= exp2(sink-sink)), acc = 0.
+    # (zeros + scalar, not tl.full with a runtime value, which some Triton versions reject.)
+    m_i = tl.zeros([BLOCK_M], dtype=tl.float32) + sink_val * LOG2E   # running max incl. sink
     l_i = tl.full([BLOCK_M], 1.0, dtype=tl.float32)               # denom incl. sink term
     acc = tl.zeros([BLOCK_M, BLOCK_D], dtype=tl.float32)          # numerator (sink absent)
 
