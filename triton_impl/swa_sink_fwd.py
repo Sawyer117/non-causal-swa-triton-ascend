@@ -100,8 +100,11 @@ def _swa_sink_fwd_kernel(
         k_mask = (offs_n[:, None] < L) & d_mask[None, :]
         k_block = tl.load(k_ptrs, mask=k_mask, other=0.0)   # [BLOCK_N, BLOCK_D]
 
-        # scores = q . k^T, fp32 accumulate; masked d-lanes are 0*0 so the dot is exact over D
-        qk = tl.dot(q_block, tl.trans(k_block)).to(tl.float32) * qk_scale   # [BLOCK_M, BLOCK_N]
+        # scores = q . k^T, fp32 accumulate; masked d-lanes are 0*0 so the dot is exact over D.
+        # input_precision="ieee": force TRUE fp32 on fp32 inputs (CUDA tl.dot defaults to TF32,
+        # which caps accuracy at ~1e-3 and would hide math bugs). Ignored for bf16 inputs, which
+        # already accumulate bf16*bf16 -> fp32. The fp32-fast (tf32x3) route is a later tradeoff.
+        qk = tl.dot(q_block, tl.trans(k_block), input_precision="ieee").to(tl.float32) * qk_scale
 
         # bidirectional window predicate, on the fly (comparisons in fp32 to vectorize on NPU)
         keep = ((offs_n[None, :] >= offs_m[:, None] - W)
@@ -120,8 +123,8 @@ def _swa_sink_fwd_kernel(
         v_mask = (offs_n[:, None] < L) & d_mask[None, :]
         v_block = tl.load(v_ptrs, mask=v_mask, other=0.0)   # [BLOCK_N, BLOCK_D]
 
-        # P@V: cast P back to v.dtype per the contract; accumulate in fp32
-        acc = acc * alpha[:, None] + tl.dot(p.to(v_block.dtype), v_block)
+        # P@V: cast P back to v.dtype per the contract; accumulate in fp32 (ieee: true fp32 path)
+        acc = acc * alpha[:, None] + tl.dot(p.to(v_block.dtype), v_block, input_precision="ieee")
         m_i = m_ij
 
     o = acc / l_i[:, None]                            # sink is in l_i, absent from acc
