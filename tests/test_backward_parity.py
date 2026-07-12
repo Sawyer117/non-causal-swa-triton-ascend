@@ -72,16 +72,18 @@ def run_windowed(tag, B, H, L, D, wl, wr, *, mla=False, block_m=32, block_n=32):
     v0 = torch.randn(*ksh, device=_DEV, dtype=torch.float32)
     sink0 = torch.randn(H, device=_DEV, dtype=torch.float32)
     do = torch.randn(B, H, L, D, device=_DEV, dtype=torch.float32)
-    _, gref = _grads(lambda a, b, c, s: swa_sink_attention(a, b, c, s, wl, wr, scale=scale,
-                     compute_dtype=torch.float32), (q0, k0, v0, sink0), do)
     print(f"\n### {tag}   B={B} H={H} L={L} D={D}  window=(L{wl},R{wr})  {'MLA' if mla else 'MHA'}")
     ok = True
     for dt in _DTYPES:
         atol, rtol = _tol(dt)
         print(f"  dtype={str(dt).replace('torch.','')}")
+        qd, kd, vd, dod = q0.to(dt), k0.to(dt), v0.to(dt), do.to(dt)
+        # reference grads on the SAME dt-rounded inputs, fp32 compute -> isolates kernel/bwd fidelity
+        _, gref = _grads(lambda a, b, c, s: swa_sink_attention(a, b, c, s, wl, wr, scale=scale,
+                         compute_dtype=torch.float32),
+                         (qd.float(), kd.float(), vd.float(), sink0), dod.float())
         _, g = _grads(lambda a, b, c, s: swa_sink_attn(a, b, c, s, wl, wr, scale=scale,
-                      BLOCK_M=block_m, BLOCK_N=block_n),
-                      (q0.to(dt), k0.to(dt), v0.to(dt), sink0), do.to(dt))
+                      BLOCK_M=block_m, BLOCK_N=block_n), (qd, kd, vd, sink0), dod)
         for nm, gg, gr in zip("q k v sink".split(), g, gref):
             ok &= _cmp(tag, nm, gg, gr, atol, rtol)
     return ok
@@ -96,18 +98,21 @@ def run_gold(tag, N, BS, KV, H, D, *, block_m=16, block_n=16):
     vg = torch.randn(N, KV, H, D, device=_DEV, dtype=torch.float32)
     sink0 = torch.randn(H, device=_DEV, dtype=torch.float32)
     dog = torch.randn(N, BS, H, D, device=_DEV, dtype=torch.float32)
-    _, gref = _grads(lambda a, b, c, s: dspark_block_attention_ref(a, b, c, s, scale=scale,
-                     compute_dtype=torch.float32), (qg, kg, vg, sink0), dog)   # [N,BS,H,D] grads
     print(f"\n### {tag}   N={N} BS={BS} KV={KV} H={H} D={D}  vs gold dspark_block_attention_ref")
     ok = True
     for dt in _DTYPES:
         atol, rtol = _tol(dt)
         print(f"  dtype={str(dt).replace('torch.','')}")
+        qg_d, kg_d, vg_d, dog_d = qg.to(dt), kg.to(dt), vg.to(dt), dog.to(dt)
+        # gold grads on the SAME dt-rounded inputs, fp32 compute (block layout [N,BS,H,D])
+        _, gref = _grads(lambda a, b, c, s: dspark_block_attention_ref(a, b, c, s, scale=scale,
+                         compute_dtype=torch.float32),
+                         (qg_d.float(), kg_d.float(), vg_d.float(), sink0), dog_d.float())
         # kernel eats [N,H,*,D]; transpose inputs, grads, and do
-        qk = qg.permute(0, 2, 1, 3).contiguous().to(dt)
-        kk = kg.permute(0, 2, 1, 3).contiguous().to(dt)
-        vk = vg.permute(0, 2, 1, 3).contiguous().to(dt)
-        dok = dog.permute(0, 2, 1, 3).contiguous().to(dt)
+        qk = qg_d.permute(0, 2, 1, 3).contiguous()
+        kk = kg_d.permute(0, 2, 1, 3).contiguous()
+        vk = vg_d.permute(0, 2, 1, 3).contiguous()
+        dok = dog_d.permute(0, 2, 1, 3).contiguous()
         _, g = _grads(lambda a, b, c, s: dense_sink_attn(a, b, c, s, scale=scale,
                       BLOCK_M=block_m, BLOCK_N=block_n), (qk, kk, vk, sink0), dok)
         gt = [g[0].permute(0, 2, 1, 3), g[1].permute(0, 2, 1, 3), g[2].permute(0, 2, 1, 3), g[3]]

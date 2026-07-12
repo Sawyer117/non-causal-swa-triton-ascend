@@ -107,12 +107,18 @@ PASS/FAIL
 
 ## 5. How to read it (the two bars are intentional)
 
+Both bars compare the kernel to a reference computed **on the same (dtype-rounded) inputs**,
+upcast to fp32 — so the error isolates the KERNEL's fidelity, not the fp32→bf16 *input*
+rounding (which isn't the kernel's job).
+
 - **float32 is the correctness gate.** The kernel forces `input_precision="ieee"` (true
   fp32, no TF32), so the `float32` row's `maxAbs` should be **~1e-6**. That's the real signal
   the math is right. If fp32 `maxAbs` is ~1e-3 → TF32 leaked in; ~1e-2 → a genuine math bug.
-- **bfloat16 is deployment realism.** bf16 has an ~8-bit mantissa (~4e-3 relative), so a
-  `maxAbs`/`meanAbs` around ~1e-2 vs the fp32 reference is the **format floor**, not a bug.
-  That's why its tolerance is 2e-2 while fp32's is 1e-5.
+- **bfloat16 is deployment realism.** With identical inputs, the bf16 error reflects the
+  kernel's fp32-accumulation + bf16 P@V + **bf16 output rounding** (~4e-3 relative is the
+  inherent floor, since the kernel returns bf16). Expect `maxAbs` a few×1e-3, well under the
+  2e-2 tolerance. (A bf16-vs-*fp32-original-input* comparison would instead be ~1e-2 — that
+  extra gap is the input rounding, not a kernel error.)
 - `[sink0]` confirms `sink -> -inf` collapses to plain windowed softmax; `[sinkE]` confirms
   a finite sink actually changes the output.
 

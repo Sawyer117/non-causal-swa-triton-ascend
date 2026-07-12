@@ -71,7 +71,11 @@ def _row(tag, dt, o, ref, atol, rtol):
 
 
 def run_windowed(tag, B, H, L, D, wl, wr, *, mla=False, block_m=32, block_n=32):
-    """Windowed self-attention vs eager swa_sink_attention (MHA or MLA-shared K/V)."""
+    """Windowed self-attention vs eager swa_sink_attention (MHA or MLA-shared K/V).
+
+    The reference is computed on the SAME (dtype-rounded) inputs the kernel sees, upcast to
+    fp32 — so the error isolates the KERNEL's fidelity (fp32 accumulation + bf16 P@V + bf16
+    output rounding), NOT the fp32->bf16 input rounding (which isn't the kernel's job)."""
     torch.manual_seed(SEED)
     scale = D ** -0.5
     q32 = torch.randn(B, H, L, D, device=_DEV, dtype=torch.float32)
@@ -79,14 +83,16 @@ def run_windowed(tag, B, H, L, D, wl, wr, *, mla=False, block_m=32, block_n=32):
     k32 = torch.randn(*kshape, device=_DEV, dtype=torch.float32)
     v32 = torch.randn(*kshape, device=_DEV, dtype=torch.float32)
     sink = torch.randn(H, device=_DEV, dtype=torch.float32)
-    ref = swa_sink_attention(q32, k32, v32, sink, wl, wr, scale=scale, compute_dtype=torch.float32)
     print(f"\n### {tag}   B={B} H={H} L={L} D={D}  window=(L{wl},R{wr})  "
           f"{'MLA-shared' if mla else 'MHA'}  tile=({block_m},{block_n})")
     ok = True
     for dt in _DTYPES:
         atol, rtol = _tol(dt)
+        qd, kd, vd = q32.to(dt), k32.to(dt), v32.to(dt)
+        ref = swa_sink_attention(qd.float(), kd.float(), vd.float(), sink, wl, wr,
+                                 scale=scale, compute_dtype=torch.float32)  # same inputs, fp32 compute
         try:
-            o = swa_sink_attn_fwd(q32.to(dt), k32.to(dt), v32.to(dt), sink, wl, wr,
+            o = swa_sink_attn_fwd(qd, kd, vd, sink, wl, wr,
                                   scale=scale, BLOCK_M=block_m, BLOCK_N=block_n)
         except Exception as e:  # noqa: BLE001
             print(f"  [{str(dt).replace('torch.',''):8}] KERNEL RAISED: {type(e).__name__}: {str(e)[:60]}")
@@ -97,29 +103,38 @@ def run_windowed(tag, B, H, L, D, wl, wr, *, mla=False, block_m=32, block_n=32):
 
 def run_gold(tag, N, BS, KV, H, D, *, mla=False, block_m=16, block_n=16):
     """Dense cross-attention vs the gold dspark_block_attention_ref at BLOCK shapes.
-    gold: q[N,BS,H,D], k/v[N,KV,H,D]; kernel eats q[N,H,BS,D], k/v[N,H,KV,D] (transpose)."""
+    gold: q[N,BS,H,D], k/v[N,KV,H,D]; kernel eats q[N,H,BS,D], k/v[N,H,KV,D] (transpose).
+    The gold is computed on the SAME (dtype-rounded) inputs the kernel sees, upcast to fp32,
+    so the error isolates kernel fidelity, not the input's fp32->bf16 rounding."""
     torch.manual_seed(SEED)
     scale = D ** -0.5
     qg = torch.randn(N, BS, H, D, device=_DEV, dtype=torch.float32)
     if mla:   # one latent KV head shared across all H (num_kv_heads=1)
         kL = torch.randn(N, KV, D, device=_DEV, dtype=torch.float32)
         vL = torch.randn(N, KV, D, device=_DEV, dtype=torch.float32)
-        kg = kL.unsqueeze(2).expand(N, KV, H, D); vg = vL.unsqueeze(2).expand(N, KV, H, D)
-        k_kv, v_kv = kL, vL                                    # [N,KV,D] MLA path for the kernel
     else:
         kg = torch.randn(N, KV, H, D, device=_DEV, dtype=torch.float32)
         vg = torch.randn(N, KV, H, D, device=_DEV, dtype=torch.float32)
-        k_kv = kg.permute(0, 2, 1, 3).contiguous(); v_kv = vg.permute(0, 2, 1, 3).contiguous()
     sink = torch.randn(H, device=_DEV, dtype=torch.float32)
-    gold = dspark_block_attention_ref(qg, kg, vg, sink, scale=scale, compute_dtype=torch.float32)  # [N,BS,H,D]
-    q_kv = qg.permute(0, 2, 1, 3).contiguous()                # [N,H,BS,D]
     print(f"\n### {tag}   N={N} BS={BS} KV={KV} H={H} D={D}  {'MLA-shared' if mla else 'MHA'}  "
           f"tile=({block_m},{block_n})  vs gold dspark_block_attention_ref")
     ok = True
     for dt in _DTYPES:
         atol, rtol = _tol(dt)
+        qg_d = qg.to(dt)
+        if mla:
+            kL_d, vL_d = kL.to(dt), vL.to(dt)
+            kg_ref = kL_d.float().unsqueeze(2).expand(N, KV, H, D)     # [N,KV,H,D] for the gold
+            vg_ref = vL_d.float().unsqueeze(2).expand(N, KV, H, D)
+            k_kv, v_kv = kL_d, vL_d                                    # [N,KV,D] MLA path for the kernel
+        else:
+            kg_d, vg_d = kg.to(dt), vg.to(dt)
+            kg_ref, vg_ref = kg_d.float(), vg_d.float()
+            k_kv = kg_d.permute(0, 2, 1, 3).contiguous(); v_kv = vg_d.permute(0, 2, 1, 3).contiguous()
+        gold = dspark_block_attention_ref(qg_d.float(), kg_ref, vg_ref, sink,
+                                          scale=scale, compute_dtype=torch.float32)   # [N,BS,H,D]
         try:
-            o = dense_sink_attn_fwd(q_kv.to(dt), k_kv.to(dt), v_kv.to(dt), sink,
+            o = dense_sink_attn_fwd(qg_d.permute(0, 2, 1, 3).contiguous(), k_kv, v_kv, sink,
                                     scale=scale, BLOCK_M=block_m, BLOCK_N=block_n)
         except Exception as e:  # noqa: BLE001
             print(f"  [{str(dt).replace('torch.',''):8}] KERNEL RAISED: {type(e).__name__}: {str(e)[:60]}")
@@ -145,10 +160,12 @@ def run_sink_checks():
     v = torch.randn(B, H, L, D, device=_DEV, dtype=torch.float32)
     sink = torch.randn(H, device=_DEV, dtype=torch.float32)
     ninf = torch.full((H,), -1e9, device=_DEV, dtype=torch.float32)
-    ref_ninf = swa_sink_attention(q, k, v, ninf, wl, wr, scale=scale, compute_dtype=torch.float32)
-    o_ninf = swa_sink_attn_fwd(q.to(dt), k.to(dt), v.to(dt), ninf, wl, wr, scale=scale)
+    qd, kd, vd = q.to(dt), k.to(dt), v.to(dt)
+    ref_ninf = swa_sink_attention(qd.float(), kd.float(), vd.float(), ninf, wl, wr,
+                                  scale=scale, compute_dtype=torch.float32)   # same inputs
+    o_ninf = swa_sink_attn_fwd(qd, kd, vd, ninf, wl, wr, scale=scale)
     c0 = torch.allclose(o_ninf.float(), ref_ninf.float(), atol=atol, rtol=rtol)
-    o_fin = swa_sink_attn_fwd(q.to(dt), k.to(dt), v.to(dt), sink, wl, wr, scale=scale)
+    o_fin = swa_sink_attn_fwd(qd, kd, vd, sink, wl, wr, scale=scale)
     d = (o_fin.float() - o_ninf.float()).abs().mean().item()
     ok &= c0 and d > 1e-3
     print(f"  [win  sink0] sink->-inf == windowed softmax: allclose={c0}  {'OK' if c0 else 'FAIL'}")
