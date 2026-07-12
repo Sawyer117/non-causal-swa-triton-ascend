@@ -197,6 +197,14 @@ plus fwd and fwd+bwd speedup — add a `bench("triton", attn_triton)` row):
   vs npu_fa) for quick iteration. Env knobs on both: `DTYPE=float32`, `ATOL`, `RTOL`, `BS`,
   `WIN`, `NBLK`, `H`, `D`.
 
+**Recorded parity, and an open number (a lead).** Our einsum+sink impl vs the torch reference
+`_dspark_attention_reference` is **bit-exact: meanAbs = meanRel = 0.00e+00** (out + grad; A3,
+2026-07-07). What was **never recorded** is the per-element error of the actual **compiled SAS
+fused kernel** (`npu_sparse_attn_sharedkv`) vs that reference — only a binary "parity pass" +
+the end-to-end match (AR 58.79% / AL 3.94 vs GPU ref AL 3.86). `fused_sas_vs_reference_parity.py`
+(top level) produces that missing number on the A3, and doubles as the template to validate a
+Triton kernel against the same fused op / reference.
+
 ---
 
 ## 7. Platform notes
@@ -217,6 +225,7 @@ swa_noncausal_sink_kernel/
 ├── README.md                        # this spec
 ├── LICENSE                          # MIT
 ├── eager_reference.py               # THE diff target: gold block form + packed-SWA, oracle + gradcheck + REAL shapes
+├── fused_sas_vs_reference_parity.py # LEAD: compiled SAS fused op vs torch reference on A3 (the un-recorded number)
 └── reference_from_repo/             # verbatim ground-truth
     ├── dspark_attn_ref_bench.py     # GOLD bench: real DSV4 shapes vs vllm_ascend _dspark_attention_reference + _dspark_sas_window
     ├── dsv4_mla_ref.py              # sink_attention (the exact softmax+sink math), RoPE, RMSNorm, MLAConfig
