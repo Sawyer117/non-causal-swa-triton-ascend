@@ -16,11 +16,17 @@ This repo is a **kernel-development spin-off**. The source of truth lives upstre
 DSpark draft work — pull updates and check parity against it, not against this snapshot:
 
 - **Upstream repo:** `Sawyer117/speculators` (a fork of `vllm-project/speculators`)
-- **Branch:** `feat/dspark-confidence-head`
-- **Path:** `examples/ascend_npu_dflash/`  — the files under `reference_from_repo/` here
-  are verbatim copies from there; `sink_attention` (`dsv4_mla_ref.py`) is the canonical math.
+- **Reference files** (`reference_from_repo/`): branch `feat/dspark-confidence-head`,
+  `examples/ascend_npu_dflash/` — verbatim copies; `sink_attention` (`dsv4_mla_ref.py`) is
+  the canonical training math.
+- **Real config / shapes** (§3): branch `feat/dsv4-dspark`,
+  `src/speculators/models/dsv4_dspark/config.py` (`DSV4DSparkConfig`).
+- **The ultimate GOLD** the fused op is validated against on-box:
+  `vllm_ascend/ops/dspark_attention.py::_dspark_attention_reference` (and `_dspark_sas_window`
+  for the window), a.k.a. the **SAS** op (Sliding-window Attention with Sink). The
+  `reference_from_repo/dspark_attn_ref_bench.py` harness benches against it.
 
-If the eager reference and the upstream files ever disagree, **upstream wins**.
+If the eager reference and the upstream / vllm_ascend gold ever disagree, **the gold wins**.
 
 ---
 
@@ -32,8 +38,8 @@ primitive gives us today:
 | property     | meaning                                                                 |
 |--------------|-------------------------------------------------------------------------|
 | **SWA**      | each query attends only to keys within a window                         |
-| **NON-CAUSAL** | the window is **bidirectional** — `j ∈ [i-window, i+window]`, not `j ≤ i` |
-| **SINK**     | a per-head learnable "attention sink" logit joins the softmax as one extra column, then is dropped from the value sum (StreamingLLM-style off-ramp) |
+| **NON-CAUSAL** | the window is **bidirectional and ASYMMETRIC** — `j ∈ [i-win_left, i+win_right]`, where `win_left = window+block_size-1`, `win_right = block_size-1` (**not** the naive symmetric `window-1`; see §4) |
+| **SINK**     | a per-head learnable "attention sink" logit that sits in the softmax **denominator** (a StreamingLLM off-ramp); it normalises but is never a value in the weighted sum |
 
 It runs in the **training** path of the DSpark draft, so it must be **forward + backward**
 (autograd-clean, grads flowing to `q, k, v` **and** the sink parameter).
@@ -45,13 +51,17 @@ It runs in the **training** path of the DSpark draft, so it must be **forward + 
 For query `i`, head `h`:
 
 ```
-scores[j] = (q_i · k_j) * scale                         # fp32, even if q/k bf16
-scores[j] = -inf   if  not (i-window <= j <= i+window)  # bidirectional SWA
-logits    = concat( scores[0..Lk-1] , sink[h] )         # sink is a RAW fp32 logit:
-                                                        #   NOT * scale, NOT masked
-logits   -= max(logits)                                 # sink participates in the max/norm
-p         = softmax(logits)[0..Lk-1]                     # DROP the sink column
-o_i       = sum_j  p[j] * v_j                            # P cast back to v.dtype for P@V
+scores[j] = (q_i · k_j) * scale                                # fp32, even if q/k bf16
+scores[j] = -inf  if not (i-win_left <= j <= i+win_right)      # asymmetric SWA (§4)
+logits    = concat( scores[0..Lk-1] , sink[h] )                # sink is a RAW fp32 logit:
+                                                               #   NOT * scale, NOT masked
+logits   -= max(logits)                                        # sink participates in the max/norm
+p         = softmax(logits)[0..Lk-1]                            # DROP the sink column
+o_i       = sum_j  p[j] * v_j                                   # P cast back to v.dtype for P@V
+
+# equivalently (the gold form, vllm_ascend _dspark_attention_reference):
+#   smax = max( scores.max(), sink[h] );  e = exp(scores - smax)
+#   p    = e / ( e.sum() + exp(sink[h] - smax) );  o_i = p @ V
 ```
 
 Gotchas that are easy to get wrong (all verified against the model in `reference_from_repo/`):
@@ -71,46 +81,73 @@ Gotchas that are easy to get wrong (all verified against the model in `reference
 
 ---
 
-## 3. Shapes & layouts
+## 3. Shapes & layouts — REAL DeepSeek-V4-Flash-DSpark values
 
-Same math, two KV layouts — target whichever the integrator wires up:
+These are **fixed model constants** from the HF `config.json` (source: `DSV4DSparkConfig`,
+branch `feat/dsv4-dspark`). Put these in the tests — don't use toy sizes as the "real" case.
 
-- **MHA (primary target):** `q,k,v = [B, H, L, D]`, per-head keys/values.
-  This is the isolated SWA microbench (`reference_from_repo/dspark_swa_attn_bench.py`).
-- **MLA-shared (DSV4 model):** `q = [B, H, L, D]`, `k,v = [B, Lk, D]` — **one latent KV
-  shared across all heads**. This is what `DSparkMTPSelfAttention` actually uses
-  (`reference_from_repo/dspark_block_attention.py` → `sink_attention`). If you only do
-  one, do MHA first; MLA-shared just drops the `H` axis on K/V.
+| symbol        | value    | meaning                                                      |
+|---------------|----------|--------------------------------------------------------------|
+| `H` heads     | **64**   | query heads (`num_attention_heads`)                          |
+| `num_kv_heads`| **1**    | **MLA** — one latent K/V **shared across all 64 query heads** |
+| `D` head_dim  | **512**  | per-head q/k/v width (`nope | rope`)                          |
+| `rope_head_dim` | **64** | trailing slice of `D` that is rotated (**partial** RoPE)     |
+| `window`      | **128**  | sliding-window context tokens                                |
+| `block_size` (γ) | **5** (config) / **7** (block7 ckpt) | draft tokens per forward |
+| `hidden_size` | **4096** | model dim (for the projections, not the attention core)      |
+| `vocab_size`  | **129280** | (`noise_token_id=128799`)                                  |
+| `scale`       | **D**⁻⁰·⁵ = 512⁻⁰·⁵ | softmax scale                                    |
+| n_draft_layers | **3**   | `target_layer_ids = (40, 41, 42)` — 3 attention layers/draft |
 
-`sink = [H]` fp32. Output `o = [B, H, L, D]`.
-Representative draft-block sizes from the bench: `B=2, H=8, L=512, D=64, window=±16`.
+Per-invocation tensor shapes (the **block view**, = the gold parity target):
+
+```
+q    : [N, block_size, H, D]          # N = number of draft blocks (~num_anchors)
+k,v  : [N, KV,         H, D]           # KV = window + block_size  (real K/V is 1 MLA head, broadcast)
+sink : [H]                             # per-head, fp32
+o    : [N, block_size, H, D]
+```
+Real magnitudes: `H=64, D=512, window=128, block_size∈{5,7}` → `KV = 133 or 135`.
+`N` scales with sequence/anchors (the bench scans `NBLK=64 … 512`).
+
+**Layouts** (same math): **MLA-shared** (real, `num_kv_heads=1`) vs **MHA** (K/V expanded
+per-head — a conservative memory over-estimate the bench uses). Do MHA first if simpler;
+MLA-shared just drops the head axis on K/V. **RoPE is applied outside this op** (partial:
+only the last 64 of 512 dims, on q & k pre-attention; inverse-rotated on the output).
 
 ---
 
-## 4. The mask: isolated vs. real
+## 4. The mask — two equivalent views (get the window right!)
 
-There are **two** mask structures in play. Know both.
+The DSpark draft attention has **one** real structure, expressible two ways.
 
-**(a) Isolated bidirectional SWA** — what "SWA non-causal" names, and the tractable first
-kernel. `keep[i,j] = (j >= i-window) & (j <= i+window)`. Square attention, per-head KV.
-This is `attn_eager` in `dspark_swa_attn_bench.py` and `bidirectional_window_mask` in
-`eager_reference.py`. **A kernel must test this predicate on the fly — never materialize a
-dense `[L,L]` mask** (that defeats the purpose; dense-mask SDPA is the slow baseline we're
-replacing).
+**(a) Block view — the gold parity target.** Per draft block, the `block_size` queries attend
+**densely** to `[ last window context tokens | the FULL block ]` (**non-causal within the
+block** — intra-block causality is the Markov head's job, not the attention's), plus the
+per-head sink. Because the K/V is *already* the windowed-context + block, there's no masking
+**inside** a block — it's dense over `KV = window + block_size`. This is
+`dspark_block_attention_ref` in `eager_reference.py` == the gold `_dspark_attention_reference`
+== the bench's `attn_manual`.
 
-**(b) Real packed anchor-block mask** — the full training op the kernel ultimately plugs
-into (`src/speculators/models/dflash/attention.py::create_anchor_block_mask_mod`, and its
-single-block reduction `dspark_block_mask` in `reference_from_repo/dspark_method.py`).
-KV = `[ packed base sequence | synthetic anchor blocks ]`; each query block `j` (one anchor)
-may attend to:
-   - base tokens in the **same document**, **before** its anchor, **within `window`** of it
-     (`same_doc & before_anchor & in_window`) — this is the causal SWA part on the context,
-   - **all** tokens of its **own** block (non-causal in-block; intra-block causality is the
-     Markov head's job, not the attention's).
-Plus the per-head sink. This is doc-aware and anchor-indexed — richer than (a). Build the
-kernel general enough (window params + block layout, or an optional additive-mask input)
-that it can express (b), even if you validate on (a) first. `eager_reference.py` accepts an
-optional `add_mask` for exactly this.
+**(b) Packed-SWA view — what an efficient kernel implements.** Over one long packed sequence,
+this is a sliding-window attention with an **asymmetric** window + sink:
+
+```
+keep[i,j] = (j >= i - win_left) & (j <= i + win_right)
+win_left  = window + block_size - 1        # e.g. 128 + 7 - 1 = 134
+win_right = block_size - 1                 # e.g. 7 - 1 = 6
+```
+
+⚠️ **Do not use the naive symmetric `window-1`.** vLLM-Ascend ships a test that rejects it;
+the real window is asymmetric. `dspark_sas_window(block_size, window)` (in `eager_reference.py`,
+mirroring vllm_ascend `_dspark_sas_window`) returns `(win_left, win_right)`. This is
+`swa_sink_attention` in `eager_reference.py`. **A kernel must test the window predicate on the
+fly — never materialize a dense `[L,L]` mask** (that's the slow SDPA baseline we're replacing).
+
+For completeness, the DFlash training path builds an even richer doc-aware packed mask
+(`src/speculators/models/dflash/attention.py::create_anchor_block_mask_mod`: `same_doc &
+before_anchor & in_window` on the context, full non-causal in-block). Keep the kernel general
+(window params, optional additive-mask input via `add_mask`) so it can express that too.
 
 ---
 
@@ -125,8 +162,9 @@ On Ascend NPU (this is the whole motivation — see `reference_from_repo/dspark_
 | dense-mask `F.scaled_dot_product_attention` | works, autograd-clean, but **O(L²) mask + memory** — the slow baseline |
 | **eager fp32 softmax** | always works, always has autograd — the guaranteed fallback, slowest |
 
-So the fused Triton kernel's job: **bidirectional windowed attention + per-head sink, fwd+bwd,
-without an O(L²) dense mask**, faster than dense SDPA, numerically matching the fp32 eager ref.
+So the fused Triton kernel's job: **asymmetric (win_left, win_right) windowed attention +
+per-head sink, fwd+bwd, without an O(L²) dense mask** — faster than dense SDPA, numerically
+matching the gold `_dspark_attention_reference` / the fp32 eager ref.
 
 ---
 
@@ -140,12 +178,16 @@ A kernel is done when, vs `eager_reference.py` (the fp32 reference):
    kernel's bwd must pass the same `gradcheck` the eager ref passes.
 3. **Sink behaviour.** `sink → -inf` reproduces plain windowed softmax; finite sink diverts
    mass (non-trivial output delta). The eager self-test asserts both.
-4. **Speed.** Faster than dense-mask SDPA on the draft-block shapes, fwd and fwd+bwd.
+4. **Speed.** Faster than dense-mask SDPA on the **real** draft-block shapes (§3), fwd and fwd+bwd.
 
-Reuse the harness in `reference_from_repo/dspark_swa_attn_bench.py`: it already reports
-`allclose / mean-abs / mean-rel` for output **and** q-grad, plus fwd and fwd+bwd speedup vs
-the eager reference. Add your kernel as another `bench("triton", attn_triton)` row and add a
-sink column to its reference. Env knobs: `DTYPE=float32`, `ATOL`, `RTOL`.
+Two harnesses to reuse (both report `allclose / mean-abs / mean-rel` on output **and** q-grad,
+plus fwd and fwd+bwd speedup — add a `bench("triton", attn_triton)` row):
+- `reference_from_repo/dspark_attn_ref_bench.py` — **benches against the vllm_ascend GOLD**
+  (`_dspark_attention_reference`) at the **real DSV4 shapes** (`H=64, D=512, window=128,
+  block∈{5,7}`, `NBLK` scannable). This is the authoritative parity check; run it on the A3.
+- `reference_from_repo/dspark_swa_attn_bench.py` — the isolated SWA microbench (eager vs sdpa
+  vs npu_fa) for quick iteration. Env knobs on both: `DTYPE=float32`, `ATOL`, `RTOL`, `BS`,
+  `WIN`, `NBLK`, `H`, `D`.
 
 ---
 
@@ -165,15 +207,18 @@ sink column to its reference. Env knobs: `DTYPE=float32`, `ATOL`, `RTOL`.
 ```
 swa_noncausal_sink_kernel/
 ├── README.md                        # this spec
-├── eager_reference.py               # THE diff target: pure-torch fwd+bwd, oracle + gradcheck
-└── reference_from_repo/             # verbatim ground-truth (feat/dspark-confidence-head)
+├── LICENSE                          # MIT
+├── eager_reference.py               # THE diff target: gold block form + packed-SWA, oracle + gradcheck + REAL shapes
+└── reference_from_repo/             # verbatim ground-truth
+    ├── dspark_attn_ref_bench.py     # GOLD bench: real DSV4 shapes vs vllm_ascend _dspark_attention_reference + _dspark_sas_window
     ├── dsv4_mla_ref.py              # sink_attention (the exact softmax+sink math), RoPE, RMSNorm, MLAConfig
     ├── dspark_method.py             # dspark_block_mask (single-block window/non-causal mask), heads, loss
     ├── dspark_block_attention.py    # DSparkMTPSelfAttention: how sink_attention+mask compose in the model (MLA-shared)
-    ├── dspark_swa_attn_bench.py     # NPU bench harness: eager vs sdpa vs npu_fa, parity + speedup (reuse this)
+    ├── dspark_swa_attn_bench.py     # isolated SWA microbench: eager vs sdpa vs npu_fa, parity + speedup
     └── dspark_npu_op_check.py       # proves flex fails / npu_fa is causal-only on Ascend (the "why a kernel")
 ```
 
-**Start here:** read `dsv4_mla_ref.py::sink_attention` (the exact math) and
-`dspark_swa_attn_bench.py::attn_eager` (the window structure), then run
-`python eager_reference.py` to see the contract pass, then write the kernel against it.
+**Start here:** read `dsv4_mla_ref.py::sink_attention` + `dspark_attn_ref_bench.py::attn_manual`
+(the exact gold math + real shapes), run `python eager_reference.py` to see the contract pass
+(oracle + gradcheck + real-shape smoke), then write the kernel against it and validate with
+`dspark_attn_ref_bench.py` on the A3.
