@@ -57,7 +57,12 @@ python -c "import torch, triton; print('torch', torch.__version__, 'cuda', torch
 ```bash
 python tests/test_forward_parity.py                 # forward: runs BOTH fp32 and bf16
 python tests/test_backward_parity.py                # backward: grads for q,k,v,sink vs the gold
+python tests/bench_speed.py                          # speed + memory vs EAGER (bf16)
 ```
+
+`bench_speed.py` benches the kernel against the **eager** reference (not dense SDPA — SDPA
+can't do the sink, so it's not a usable path). Reports fwd / fwd+bwd speedup and peak memory;
+at large L eager (O(L^2) scores) OOMs while the kernel (O(L*window)) keeps running.
 
 `test_backward_parity.py` exercises the autograd op (`swa_sink_attn` / `dense_sink_attn` —
 fast Triton forward + **fused Triton backward** dq/dk/dv + torch dsink) and checks

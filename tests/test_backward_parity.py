@@ -49,10 +49,12 @@ def _tol(dt):
 
 
 def _cmp(tag, name, g, gref, atol, rtol):
-    d = (g.float() - gref.float()).abs()
-    close = torch.allclose(g.float(), gref.float(), atol=atol, rtol=rtol)
-    print(f"    grad_{name:4} allclose={close}  maxAbs={d.max().item():.2e}  "
-          f"meanAbs={d.mean().item():.2e}  {'OK' if close else 'FAIL'}")
+    gf, rf = g.float(), gref.float()
+    d = (gf - rf).abs()
+    close = torch.allclose(gf, rf, atol=atol, rtol=rtol)   # gate covers BOTH abs (atol) and rel (rtol)
+    mre = (d / (rf.abs() + 1e-6)).mean().item()
+    print(f"    grad_{name:4} allclose={close}  meanAbs={d.mean().item():.2e}  meanRel={mre:.2e}  "
+          f"maxAbs={d.max().item():.2e}  {'OK' if close else 'FAIL'}")
     return close
 
 
