@@ -85,6 +85,30 @@ def run_dense(tag, N, BS, KV, H, D, *, mla=False):
     return ok
 
 
+def run_gridstride(wl, wr):
+    """The grid is core-capped, so each program strides over many tiles. Force tiny grids
+    (num_programs=1, 3) so the stride loop iterates a lot, and confirm results are unchanged."""
+    torch.manual_seed(0)
+    B, H, L, D = 2, 8, 384, 64
+    scale = D ** -0.5
+    q = torch.randn(B, H, L, D, device=_DEV, dtype=torch.bfloat16)
+    k = torch.randn(B, H, L, D, device=_DEV, dtype=torch.bfloat16)
+    v = torch.randn(B, H, L, D, device=_DEV, dtype=torch.bfloat16)
+    sink = torch.randn(H, device=_DEV, dtype=torch.float32)
+    ref = swa_sink_attention(q.float(), k.float(), v.float(), sink, wl, wr,
+                             scale=scale, compute_dtype=torch.float32)
+    print("\n### grid-stride  (each program processes many tiles; must match regardless of grid)")
+    ok = True
+    for npg in (1, 3, None):    # None = the core-capped default
+        o, _ = swa_sink_attn_fwd_ascend(q, k, v, sink, wl, wr, scale=scale, num_programs=npg)
+        d = (o.float() - ref.float()).abs()
+        close = torch.allclose(o.float(), ref.float(), atol=2e-2, rtol=2e-2)
+        ok &= close
+        print(f"  num_programs={str(npg):5}  allclose={close}  maxAbs={d.max().item():.2e}  "
+              f"{'OK' if close else 'FAIL'}")
+    return ok
+
+
 def main():
     if not torch.cuda.is_available():
         print("!! run on the GPU box"); raise SystemExit(1)
@@ -93,6 +117,7 @@ def main():
     wl, wr = dspark_sas_window(BS, WIN)
     KV = WIN + BS
     ok = True
+    ok &= run_gridstride(wl, wr)
     ok &= run_windowed("[asym] windowed", 2, 8, 384, 64, wl, wr)
     ok &= run_windowed("[asym-mla] windowed MLA", 2, 8, 384, 64, wl, wr, mla=True)
     ok &= run_dense("[gold] dense", 4, BS, KV, 8, 64)
