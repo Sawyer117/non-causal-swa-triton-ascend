@@ -1,21 +1,28 @@
 # Running the forward parity test on a GPU
 
 The kernel is developed on a CPU-only box (no GPU/NPU there), so the Triton run happens
-on your GPU machine. This is the full loop: **pull → install → run → paste output back**.
+on your GPU machine. This is the full loop: **clone/pull → install → run → paste output back**.
 
 ## 0. Prereqs
 
 - An NVIDIA GPU with a working CUDA driver (`nvidia-smi` prints your card).
 - Python 3.9+.
 
-## 1. Pull the code
+## 1. Get the code
 
+First time on this machine — clone:
 ```bash
-cd <your-clone-of>/swa_noncausal_sink_kernel
+git clone https://github.com/Sawyer117/non-causal-swa-triton-ascend.git
+cd non-causal-swa-triton-ascend
+```
+
+Already cloned — just update:
+```bash
+cd non-causal-swa-triton-ascend
 git pull                       # branch: main
 ```
 
-New/updated files you're pulling:
+Files that matter:
 - `triton_impl/swa_sink_fwd.py`   — the forward Triton kernel
 - `tests/test_forward_parity.py`  — this parity test
 - `eager_reference.py`            — the fp32 diff target (already in the repo)
