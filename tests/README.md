@@ -63,16 +63,24 @@ Optional variants:
 DTYPE=float32 python tests/test_forward_parity.py    # fp32 only (the correctness gate)
 ATOL=1e-6 RTOL=1e-6 python tests/test_forward_parity.py   # tighten tolerances yourself
 SEED=1 python tests/test_forward_parity.py           # different random inputs
-NO_REAL=1 python tests/test_forward_parity.py        # skip the heavy H=64,D=512 case
+NO_REAL=1 python tests/test_forward_parity.py        # skip the heavy H=64,D=512 cases
 ```
 
-Cases it runs (each vs the fp32 eager ref):
-- `[sym ]` symmetric microbench window (first-step form), H=8 D=64
-- `[asym]` the **real asymmetric** window `dspark_sas_window(block=7,window=128)=(L134,R6)`, toy H=8 D=64
-- `[real]` the asymmetric window at **real DSV4 shapes** H=64 D=512 (skip with `NO_REAL=1`)
-- `sink behaviour`: `sink->-inf` == plain windowed softmax; a finite sink diverts mass
+Cases it runs:
+- Windowed self-attention vs the eager `swa_sink_attention` (fp32):
+  - `[sym ]` symmetric microbench window (first-step form)
+  - `[asym]` the **real asymmetric** window `dspark_sas_window(block=7,window=128)=(L134,R6)`
+  - `[asym-mla]` same, but **MLA-shared** K/V (`num_kv_heads=1` — the real model layout)
+  - `[asym-b5]` `block_size=5` → window `(L132,R4)`
+  - `[real]` real DSV4 shapes **H=64 D=512** (skip with `NO_REAL=1`)
+- Dense = **gold block-form parity** vs `dspark_block_attention_ref` (the vllm_ascend gold):
+  - `[gold]` block shapes `q[N,BS,H,D] × kv[N,KV,H,D]`, `KV=window+BS`, toy H/D
+  - `[gold-mla]` same, MLA-shared
+  - `[gold-real]` block shapes at real DSV4 **H=64 D=512** (skip with `NO_REAL=1`)
+- `sink behaviour`: `sink->-inf` == plain softmax; a finite sink diverts mass
 
-The `[real]` case uses small tiles (BLOCK=16) for shared-memory headroom on smaller GPUs.
+The `[real]`/`[gold-real]` cases use small tiles (BLOCK=8–16) for shared-memory headroom on
+smaller GPUs.
 If it raises a shared-memory/compile error (not a math error), rerun with `NO_REAL=1` and
 tell me — that's a tile-size tuning issue, separate from correctness.
 
