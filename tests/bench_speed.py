@@ -74,9 +74,11 @@ def _report(tri, eag):
               f"fwd+bwd={tmb:8.1f}MB   (eager OOM/failed -> kernel runs where eager can't)")
         return
     ef, eb, emf, emb = eag
-    print(f"    eager    fwd={ef:7.3f}ms  fwd+bwd={eb:7.3f}ms   peak fwd={emf:8.1f}MB  fwd+bwd={emb:8.1f}MB")
-    print(f"    triton   fwd={tf:7.3f}ms  fwd+bwd={tb:7.3f}ms   peak fwd={tmf:8.1f}MB  fwd+bwd={tmb:8.1f}MB")
-    print(f"    -> speedup {ef/tf:4.2f}x / {eb/tb:4.2f}x   mem  fwd {emf/tmf:4.2f}x  fwd+bwd {emb/tmb:4.2f}x")
+    ew, tw = max(eb - ef, 1e-6), max(tb - tf, 1e-6)   # backward-only ~= (fwd+bwd) - fwd
+    print(f"    eager    fwd={ef:7.3f}ms  bwd={ew:7.3f}ms  fwd+bwd={eb:7.3f}ms   peak fwd={emf:8.1f}MB  fwd+bwd={emb:8.1f}MB")
+    print(f"    triton   fwd={tf:7.3f}ms  bwd={tw:7.3f}ms  fwd+bwd={tb:7.3f}ms   peak fwd={tmf:8.1f}MB  fwd+bwd={tmb:8.1f}MB")
+    print(f"    -> speedup  fwd {ef/tf:4.2f}x   bwd {ew/tw:4.2f}x   fwd+bwd {eb/tb:4.2f}x"
+          f"    mem  fwd {emf/tmf:4.2f}x  fwd+bwd {emb/tmb:4.2f}x")
 
 
 def bench_windowed(B, H, L, D, wl, wr):
