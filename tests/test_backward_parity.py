@@ -91,34 +91,41 @@ def run_windowed(tag, B, H, L, D, wl, wr, *, mla=False, block_m=32, block_n=32):
     return ok
 
 
-def run_gold(tag, N, BS, KV, H, D, *, block_m=16, block_n=16):
-    """Dense grads vs the gold dspark_block_attention_ref grads (block layout)."""
+def run_gold(tag, N, BS, KV, H, D, *, mla=False, block_m=16, block_n=16):
+    """Dense grads vs the gold dspark_block_attention_ref grads (block layout).
+    mla=True -> one shared KV latent [N,KV,D] (num_kv_heads=1, the production path)."""
     torch.manual_seed(SEED)
     scale = D ** -0.5
     qg = torch.randn(N, BS, H, D, device=_DEV, dtype=torch.float32)
-    kg = torch.randn(N, KV, H, D, device=_DEV, dtype=torch.float32)
-    vg = torch.randn(N, KV, H, D, device=_DEV, dtype=torch.float32)
+    ksh = (N, KV, D) if mla else (N, KV, H, D)
+    kg = torch.randn(*ksh, device=_DEV, dtype=torch.float32)
+    vg = torch.randn(*ksh, device=_DEV, dtype=torch.float32)
     sink0 = torch.randn(H, device=_DEV, dtype=torch.float32)
     dog = torch.randn(N, BS, H, D, device=_DEV, dtype=torch.float32)
-    print(f"\n### {tag}   N={N} BS={BS} KV={KV} H={H} D={D}  vs gold dspark_block_attention_ref")
+    exp = (lambda t: t.unsqueeze(2).expand(N, KV, H, D)) if mla else (lambda t: t)  # latent -> [N,KV,H,D] for gold
+    print(f"\n### {tag}   N={N} BS={BS} KV={KV} H={H} D={D}  {'MLA' if mla else 'MHA'}  "
+          f"vs gold dspark_block_attention_ref")
     ok = True
     for dt in _DTYPES:
         atol, rtol = _tol(dt)
         print(f"  dtype={str(dt).replace('torch.','')}")
         qg_d, kg_d, vg_d, dog_d = qg.to(dt), kg.to(dt), vg.to(dt), dog.to(dt)
         # gold grads on the SAME dt-rounded inputs, fp32 compute (block layout [N,BS,H,D])
-        _, gref = _grads(lambda a, b, c, s: dspark_block_attention_ref(a, b, c, s, scale=scale,
-                         compute_dtype=torch.float32),
+        _, gref = _grads(lambda a, b, c, s: dspark_block_attention_ref(a, exp(b), exp(c), s,
+                         scale=scale, compute_dtype=torch.float32),
                          (qg_d.float(), kg_d.float(), vg_d.float(), sink0), dog_d.float())
-        # kernel eats [N,H,*,D]; transpose inputs, grads, and do
+        # kernel eats q [N,H,BS,D]; k/v are [N,H,KV,D] (MHA) or [N,KV,D] (MLA, unchanged)
         qk = qg_d.permute(0, 2, 1, 3).contiguous()
-        kk = kg_d.permute(0, 2, 1, 3).contiguous()
-        vk = vg_d.permute(0, 2, 1, 3).contiguous()
+        kk = kg_d if mla else kg_d.permute(0, 2, 1, 3).contiguous()
+        vk = vg_d if mla else vg_d.permute(0, 2, 1, 3).contiguous()
         dok = dog_d.permute(0, 2, 1, 3).contiguous()
         _, g = _grads(lambda a, b, c, s: dense_sink_attn(a, b, c, s, scale=scale,
                       BLOCK_M=block_m, BLOCK_N=block_n), (qk, kk, vk, sink0), dok)
-        gt = [g[0].permute(0, 2, 1, 3), g[1].permute(0, 2, 1, 3), g[2].permute(0, 2, 1, 3), g[3]]
-        for nm, gg, gr in zip("q k v sink".split(), gt, gref):
+        # bring kernel grads back to the gold layout: q always [N,BS,H,D]; k/v as-is for MLA
+        gq = g[0].permute(0, 2, 1, 3)
+        gk = g[1] if mla else g[1].permute(0, 2, 1, 3)
+        gv = g[2] if mla else g[2].permute(0, 2, 1, 3)
+        for nm, gg, gr in zip("q k v sink".split(), [gq, gk, gv, g[3]], gref):
             ok &= _cmp(tag, nm, gg, gr, atol, rtol)
     return ok
 
@@ -156,6 +163,7 @@ def main():
     ok &= run_windowed("[asym] windowed grads", 2, 8, 384, 64, wl7, wr7)
     ok &= run_windowed("[asym-mla] windowed grads MLA", 2, 8, 384, 64, wl7, wr7, mla=True)
     ok &= run_gold("[gold] dense grads vs gold", 4, BS7, KV7, 8, 64)
+    ok &= run_gold("[gold-mla] dense grads MLA (production path)", 4, BS7, KV7, 8, 64, mla=True)
     ok &= run_gradcheck()
     if not os.environ.get("NO_REAL"):
         ok &= run_windowed("[real] DSV4 H=64 D=512", 1, DSV4["num_heads"], 256,

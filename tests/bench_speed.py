@@ -111,43 +111,86 @@ def bench_windowed(B, H, L, D, wl, wr):
     _report(_measure("triton", tri_fwd, tri_fb), _measure("eager", eag_fwd, eag_fb))
 
 
-def bench_dense(N, BS, KV, H, D):
+def bench_dense(N, BS, KV, H, D, mla=False):
+    """Dense block form. mla=True -> ONE shared KV latent (num_kv_heads=1, the real model);
+    mla=False -> per-Q-head KV (MHA, the bench's conservative over-estimate). Returns (tri, eag)."""
     scale = D ** -0.5
-    qg = torch.randn(N, BS, H, D, device="cuda", dtype=DT)      # gold [N,BS,H,D]
-    kg = torch.randn(N, KV, H, D, device="cuda", dtype=DT)
-    vg = torch.randn(N, KV, H, D, device="cuda", dtype=DT)
+    qg = torch.randn(N, BS, H, D, device="cuda", dtype=DT)      # gold q [N,BS,H,D]
     sink = torch.randn(H, device="cuda", dtype=torch.float32)
-    qk = qg.permute(0, 2, 1, 3).contiguous()                   # kernel [N,H,BS,D]
-    kk = kg.permute(0, 2, 1, 3).contiguous()
-    vk = vg.permute(0, 2, 1, 3).contiguous()
+    qk = qg.permute(0, 2, 1, 3).contiguous()                   # kernel q [N,H,BS,D]
+    if mla:
+        kL = torch.randn(N, KV, D, device="cuda", dtype=DT)    # [N,KV,D] one latent head
+        vL = torch.randn(N, KV, D, device="cuda", dtype=DT)
 
-    def fresh_g():
-        return (qg.clone().requires_grad_(True), kg.clone().requires_grad_(True),
-                vg.clone().requires_grad_(True))
+        def tri_fwd():
+            with torch.no_grad():
+                dense_sink_attn(qk, kL, vL, sink, scale=scale, BLOCK_M=8, BLOCK_N=16)
 
-    def fresh_k():
-        return (qk.clone().requires_grad_(True), kk.clone().requires_grad_(True),
-                vk.clone().requires_grad_(True))
+        def tri_fb():
+            q = qk.clone().requires_grad_(True); k = kL.clone().requires_grad_(True); v = vL.clone().requires_grad_(True)
+            dense_sink_attn(q, k, v, sink, scale=scale, BLOCK_M=8, BLOCK_N=16).float().sum().backward()
 
-    def tri_fwd():
-        with torch.no_grad():
-            dense_sink_attn(qk, kk, vk, sink, scale=scale, BLOCK_M=8, BLOCK_N=16)
+        def eag_fwd():
+            with torch.no_grad():
+                dspark_block_attention_ref(qg, kL.unsqueeze(2).expand(N, KV, H, D),
+                                           vL.unsqueeze(2).expand(N, KV, H, D), sink,
+                                           scale=scale, compute_dtype=torch.float32)
 
-    def tri_fb():
-        q, k, v = fresh_k()
-        dense_sink_attn(q, k, v, sink, scale=scale, BLOCK_M=8, BLOCK_N=16).float().sum().backward()
+        def eag_fb():
+            q = qg.clone().requires_grad_(True); k = kL.clone().requires_grad_(True); v = vL.clone().requires_grad_(True)
+            dspark_block_attention_ref(q, k.unsqueeze(2).expand(N, KV, H, D),
+                                       v.unsqueeze(2).expand(N, KV, H, D), sink,
+                                       scale=scale, compute_dtype=torch.float32).float().sum().backward()
+    else:
+        kg = torch.randn(N, KV, H, D, device="cuda", dtype=DT)
+        vg = torch.randn(N, KV, H, D, device="cuda", dtype=DT)
+        kk = kg.permute(0, 2, 1, 3).contiguous(); vk = vg.permute(0, 2, 1, 3).contiguous()
 
-    def eag_fwd():
-        with torch.no_grad():
-            dspark_block_attention_ref(qg, kg, vg, sink, scale=scale, compute_dtype=torch.float32)
+        def tri_fwd():
+            with torch.no_grad():
+                dense_sink_attn(qk, kk, vk, sink, scale=scale, BLOCK_M=8, BLOCK_N=16)
 
-    def eag_fb():
-        q, k, v = fresh_g()
-        dspark_block_attention_ref(q, k, v, sink, scale=scale,
-                                   compute_dtype=torch.float32).float().sum().backward()
+        def tri_fb():
+            q = qk.clone().requires_grad_(True); k = kk.clone().requires_grad_(True); v = vk.clone().requires_grad_(True)
+            dense_sink_attn(q, k, v, sink, scale=scale, BLOCK_M=8, BLOCK_N=16).float().sum().backward()
 
-    print(f"\n### dense/gold  N={N} BS={BS} KV={KV} H={H} D={D}  dtype={DT}")
-    _report(_measure("triton", tri_fwd, tri_fb), _measure("eager", eag_fwd, eag_fb))
+        def eag_fwd():
+            with torch.no_grad():
+                dspark_block_attention_ref(qg, kg, vg, sink, scale=scale, compute_dtype=torch.float32)
+
+        def eag_fb():
+            q = qg.clone().requires_grad_(True); k = kg.clone().requires_grad_(True); v = vg.clone().requires_grad_(True)
+            dspark_block_attention_ref(q, k, v, sink, scale=scale,
+                                       compute_dtype=torch.float32).float().sum().backward()
+
+    print(f"\n### dense/gold  N={N} BS={BS} KV={KV} H={H} D={D}  {'MLA (num_kv_heads=1)' if mla else 'MHA'}  dtype={DT}")
+    tri, eag = _measure("triton", tri_fwd, tri_fb), _measure("eager", eag_fwd, eag_fb)
+    _report(tri, eag)
+    return tri, eag
+
+
+def _prod_summary(N, BS, KV, H, D, prod):
+    tri, eag = prod
+    line = "=" * 74
+    print("\n" + line)
+    print(f"PRODUCTION SUMMARY  (dtype={str(DT).replace('torch.','')}, real DSV4-Flash-DSpark "
+          f"BLOCK shape, MLA num_kv_heads=1)")
+    print(f"  {N} draft blocks:  q[BS={BS}, H={H}, D={D}]  attends  kv[KV={KV}, D={D} shared latent]  + per-head sink")
+    if tri is None:
+        print("  triton FAILED to run — see error above.")
+    elif eag is None:
+        tf, tb, tmf, tmb = tri
+        print(f"  triton fwd={tf:.3f}ms fwd+bwd={tb:.3f}ms  peak fwd={tmf:.0f}MB fwd+bwd={tmb:.0f}MB")
+        print("  eager OOM/failed at this size -> the kernel runs where eager can't.")
+    else:
+        tf, tb, tmf, tmb = tri
+        ef, eb, emf, emb = eag
+        print(f"  forward      : {ef / tf:5.2f}x faster    peak {emf / tmf:4.2f}x smaller"
+              f"   (triton {tmf:6.0f}MB  vs  eager {emf:6.0f}MB)")
+        print(f"  forward+bwd  : {eb / tb:5.2f}x faster    peak {emb / tmb:4.2f}x smaller"
+              f"   (triton {tmb:6.0f}MB  vs  eager {emb:6.0f}MB)")
+    print("  baseline = eager einsum+sink (the only correct production path; SDPA has no sink)")
+    print(line)
 
 
 def main():
@@ -156,10 +199,14 @@ def main():
     print(">>> SPEED+MEMORY  triton kernel vs EAGER (einsum+sink)  — SDPA excluded (no sink)")
     print(">>> speedup = eager_time / triton_time; mem = eager_peak / triton_peak")
     H, D = DSV4["num_heads"], DSV4["head_dim"]      # 64, 512
-    wl, wr = dspark_sas_window(DSV4["block_size"], DSV4["window_size"])   # (134, 6)
-    for L in LS:
+    BS, KV = DSV4["block_size"], DSV4["window_size"] + DSV4["block_size"]   # 7, 135
+    wl, wr = dspark_sas_window(DSV4["block_size"], DSV4["window_size"])     # (134, 6)
+    NBLK = int(os.environ.get("NBLK", "64"))        # draft blocks (~num anchors); the real scale
+    for L in LS:                                     # packed-SWA view (context)
         bench_windowed(1, H, L, D, wl, wr)
-    bench_dense(8, DSV4["block_size"], DSV4["window_size"] + DSV4["block_size"], H, D)
+    bench_dense(8, BS, KV, H, D, mla=False)          # block form, MHA over-estimate (context)
+    prod = bench_dense(NBLK, BS, KV, H, D, mla=True)  # block form, MLA = the PRODUCTION case
+    _prod_summary(NBLK, BS, KV, H, D, prod)
 
 
 if __name__ == "__main__":
