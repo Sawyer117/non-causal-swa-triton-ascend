@@ -53,11 +53,11 @@ def _peak(step):
 
 
 def _measure(name, fwd, fb):
-    """Returns (fwd_ms, fb_ms, peak_MB) or None on OOM/failure."""
+    """Returns (fwd_ms, fb_ms, fwd_peak_MB, fb_peak_MB) or None on OOM/failure."""
     try:
         fb()   # smoke (also compiles the kernel)
         torch.cuda.synchronize()
-        return _timed(fwd), _timed(fb), _peak(fb)
+        return _timed(fwd), _timed(fb), _peak(fwd), _peak(fb)
     except RuntimeError as e:  # noqa: BLE001
         torch.cuda.empty_cache()
         msg = "OOM" if "out of memory" in str(e).lower() else type(e).__name__
@@ -68,15 +68,15 @@ def _measure(name, fwd, fb):
 def _report(tri, eag):
     if tri is None:
         return
-    tf, tb, tm = tri
+    tf, tb, tmf, tmb = tri
     if eag is None:
-        print(f"    triton   fwd={tf:7.3f}ms  fwd+bwd={tb:7.3f}ms  peak={tm:8.1f}MB   "
-              f"(eager OOM/failed -> kernel runs where eager can't)")
+        print(f"    triton   fwd={tf:7.3f}ms  fwd+bwd={tb:7.3f}ms  peak fwd={tmf:8.1f}MB "
+              f"fwd+bwd={tmb:8.1f}MB   (eager OOM/failed -> kernel runs where eager can't)")
         return
-    ef, eb, em = eag
-    print(f"    eager    fwd={ef:7.3f}ms  fwd+bwd={eb:7.3f}ms  peak={em:8.1f}MB")
-    print(f"    triton   fwd={tf:7.3f}ms  fwd+bwd={tb:7.3f}ms  peak={tm:8.1f}MB   "
-          f"speedup {ef/tf:4.2f}x / {eb/tb:4.2f}x   mem {em/tm:4.2f}x less")
+    ef, eb, emf, emb = eag
+    print(f"    eager    fwd={ef:7.3f}ms  fwd+bwd={eb:7.3f}ms   peak fwd={emf:8.1f}MB  fwd+bwd={emb:8.1f}MB")
+    print(f"    triton   fwd={tf:7.3f}ms  fwd+bwd={tb:7.3f}ms   peak fwd={tmf:8.1f}MB  fwd+bwd={tmb:8.1f}MB")
+    print(f"    -> speedup {ef/tf:4.2f}x / {eb/tb:4.2f}x   mem  fwd {emf/tmf:4.2f}x  fwd+bwd {emb/tmb:4.2f}x")
 
 
 def bench_windowed(B, H, L, D, wl, wr):

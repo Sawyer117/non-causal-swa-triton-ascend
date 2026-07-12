@@ -286,9 +286,11 @@ def swa_sink_bwd(q, k, v, sink, o, lse, do, win_left, win_right, dense, scale,
 
     # dk/dv (key-parallel). MLA: one program per (key-block, batch) loops all heads and
     # accumulates in registers -> [B,LK,D] directly (no per-head buffer). MHA: per (b,h).
+    # Output buffers are the INPUT dtype (not fp32): each key-block is written exactly once
+    # (accumulation is fp32 in-kernel), so no fp32 output buffer is needed.
     if mla:
-        dk_f = torch.empty(B, LK, D, device=q.device, dtype=torch.float32)
-        dv_f = torch.empty(B, LK, D, device=q.device, dtype=torch.float32)
+        dk_f = torch.empty(B, LK, D, device=q.device, dtype=k.dtype)
+        dv_f = torch.empty(B, LK, D, device=q.device, dtype=v.dtype)
         _bwd_dkdv_mla_kernel[(triton.cdiv(LK, BN), B)](
             q, k, v, do, lse, delta, dk_f, dv_f,
             q.stride(0), q.stride(1), q.stride(2), q.stride(3),
@@ -301,8 +303,8 @@ def swa_sink_bwd(q, k, v, sink, o, lse, do, win_left, win_right, dense, scale,
             WINDOWED=windowed, BLOCK_M=BM, BLOCK_N=BN, BLOCK_D=BLOCK_D, D=D,
         )
     else:
-        dk_f = torch.empty(B, H, LK, D, device=q.device, dtype=torch.float32)
-        dv_f = torch.empty(B, H, LK, D, device=q.device, dtype=torch.float32)
+        dk_f = torch.empty(B, H, LK, D, device=q.device, dtype=k.dtype)
+        dv_f = torch.empty(B, H, LK, D, device=q.device, dtype=v.dtype)
         _bwd_dkdv_kernel[(triton.cdiv(LK, BN), B * H)](
             q, k, v, do, lse, delta, dk_f, dv_f,
             q.stride(0), q.stride(1), q.stride(2), q.stride(3),
@@ -313,8 +315,8 @@ def swa_sink_bwd(q, k, v, sink, o, lse, do, win_left, win_right, dense, scale,
             H, LQ, LK, win_left, win_right, scale,
             WINDOWED=windowed, BLOCK_M=BM, BLOCK_N=BN, BLOCK_D=BLOCK_D, D=D,
         )
-    dk = dk_f.to(k.dtype)
-    dv = dv_f.to(v.dtype)
+    dk = dk_f            # already in k/v dtype
+    dv = dv_f
 
     # dsink_h = -sum_i exp2(sink_h*log2e - lse_i) * delta_i   (over batch + queries)
     LOG2E_F = 1.4426950408889634
