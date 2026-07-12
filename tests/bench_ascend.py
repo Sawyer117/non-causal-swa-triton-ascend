@@ -182,7 +182,12 @@ def main():
         print("!! run on the GPU box"); raise SystemExit(1)
     print(">>> Ascend op GPU speed/memory vs eager  (full = GPU-fair; capped = NPU grid shape)")
     print(">>> speedup = eager / ascend; a GPU 'capped' slowdown is the grid cap, corrected on the A3")
-    print(">>> tile override: BM=.. BN=.. python tests/bench_ascend.py  (find a fast block for D=512)\n")
+    print(">>> tile override: BM=.. BN=.. python tests/bench_ascend.py  (find a fast block for D=512)")
+    if DT == torch.float32:
+        print(">>> NOTE fp32: the kernel uses input_precision='ieee' (TRUE fp32 -> the SLOW matmul "
+              "path) while eager fp32 uses fast TF32, so fp32 speed is NOT comparable and is NOT "
+              "the production path. Production is bf16 (below). ieee is CUDA-only; revisited on the A3.")
+    print()
     H, D = DSV4["num_heads"], DSV4["head_dim"]
     BS, WIN = DSV4["block_size"], DSV4["window_size"]
     KV = WIN + BS
