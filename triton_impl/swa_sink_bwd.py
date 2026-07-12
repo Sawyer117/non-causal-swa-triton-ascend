@@ -28,23 +28,7 @@ import triton.language as tl
 
 LOG2E = tl.constexpr(1.4426950408889634)
 
-# Autotune search space for the backward kernels (the bottleneck; ~3x the forward FLOPs +
-# redundant recompute). BLOCK_M/BLOCK_N + num_warps/num_stages are tuned per (LQ,LK,D) so the
-# large-D=512 register pressure is resolved on-device. NOTE: num_warps/num_stages are CUDA-only
-# levers — the Ascend-Triton autotune ignores them (drop for the NPU port; see skills autotune.md).
-_BWD_CONFIGS = [
-    triton.Config({"BLOCK_M": 16, "BLOCK_N": 16}, num_warps=4, num_stages=1),
-    triton.Config({"BLOCK_M": 16, "BLOCK_N": 32}, num_warps=4, num_stages=2),
-    triton.Config({"BLOCK_M": 32, "BLOCK_N": 16}, num_warps=4, num_stages=2),
-    triton.Config({"BLOCK_M": 32, "BLOCK_N": 32}, num_warps=4, num_stages=2),
-    triton.Config({"BLOCK_M": 32, "BLOCK_N": 64}, num_warps=8, num_stages=2),
-    triton.Config({"BLOCK_M": 64, "BLOCK_N": 32}, num_warps=8, num_stages=2),
-    triton.Config({"BLOCK_M": 64, "BLOCK_N": 64}, num_warps=8, num_stages=2),
-    triton.Config({"BLOCK_M": 16, "BLOCK_N": 64}, num_warps=8, num_stages=1),
-]
 
-
-@triton.autotune(configs=_BWD_CONFIGS, key=["LQ", "LK", "D"])
 @triton.jit
 def _bwd_dq_kernel(
     Q, K, V, DO, Lse, Delta, DQ,
@@ -114,7 +98,6 @@ def _bwd_dq_kernel(
              dq_acc.to(DQ.dtype.element_ty), mask=(m_valid[:, None] & d_mask[None, :]))
 
 
-@triton.autotune(configs=_BWD_CONFIGS, key=["LQ", "LK", "D"])
 @triton.jit
 def _bwd_dkdv_kernel(
     Q, K, V, DO, Lse, Delta, DK, DV,
@@ -191,7 +174,6 @@ def _bwd_dkdv_kernel(
              dv_acc.to(DV.dtype.element_ty), mask=(n_valid[:, None] & d_mask[None, :]))
 
 
-@triton.autotune(configs=_BWD_CONFIGS, key=["LQ", "LK", "D"])
 @triton.jit
 def _bwd_dkdv_mla_kernel(
     Q, K, V, DO, Lse, Delta, DK, DV,
@@ -284,20 +266,22 @@ def swa_sink_bwd(q, k, v, sink, o, lse, do, win_left, win_right, dense, scale,
     lse = lse.contiguous()
     delta = (do.float() * o.float()).sum(-1).contiguous()             # [B,H,LQ] fp32
     BLOCK_D = triton.next_power_of_2(D)
+    BM = max(16, BLOCK_M)                                             # tl.dot wants >= 16
+    BN = max(16, BLOCK_N)
+
     skb, skh, skn, skd = _kv_strides(k)
     svb, svh, svn, svd = _kv_strides(v)
-    # BLOCK_M/BLOCK_N + num_warps/num_stages come from @triton.autotune; the grid uses them.
 
     # dq (query-parallel; reads shared K/V via head-stride 0 for MLA)
     dq = torch.empty_like(q)
-    _bwd_dq_kernel[lambda meta: (triton.cdiv(LQ, meta["BLOCK_M"]), B * H)](
+    _bwd_dq_kernel[(triton.cdiv(LQ, BM), B * H)](
         q, k, v, do, lse, delta, dq,
         q.stride(0), q.stride(1), q.stride(2), q.stride(3),
         skb, skh, skn, skd, svb, svh, svn, svd,
         do.stride(0), do.stride(1), do.stride(2), do.stride(3),
         dq.stride(0), dq.stride(1), dq.stride(2), dq.stride(3),
         H, LQ, LK, win_left, win_right, scale,
-        WINDOWED=windowed, BLOCK_D=BLOCK_D, D=D,
+        WINDOWED=windowed, BLOCK_M=BM, BLOCK_N=BN, BLOCK_D=BLOCK_D, D=D,
     )
 
     # dk/dv (key-parallel). MLA: one program per (key-block, batch) loops all heads and
@@ -307,7 +291,7 @@ def swa_sink_bwd(q, k, v, sink, o, lse, do, win_left, win_right, dense, scale,
     if mla:
         dk_f = torch.empty(B, LK, D, device=q.device, dtype=k.dtype)
         dv_f = torch.empty(B, LK, D, device=q.device, dtype=v.dtype)
-        _bwd_dkdv_mla_kernel[lambda meta: (triton.cdiv(LK, meta["BLOCK_N"]), B)](
+        _bwd_dkdv_mla_kernel[(triton.cdiv(LK, BN), B)](
             q, k, v, do, lse, delta, dk_f, dv_f,
             q.stride(0), q.stride(1), q.stride(2), q.stride(3),
             k.stride(0), k.stride(1), k.stride(2),
@@ -316,12 +300,12 @@ def swa_sink_bwd(q, k, v, sink, o, lse, do, win_left, win_right, dense, scale,
             dk_f.stride(0), dk_f.stride(1), dk_f.stride(2),
             dv_f.stride(0), dv_f.stride(1), dv_f.stride(2),
             H, LQ, LK, win_left, win_right, scale,
-            WINDOWED=windowed, BLOCK_D=BLOCK_D, D=D,
+            WINDOWED=windowed, BLOCK_M=BM, BLOCK_N=BN, BLOCK_D=BLOCK_D, D=D,
         )
     else:
         dk_f = torch.empty(B, H, LK, D, device=q.device, dtype=k.dtype)
         dv_f = torch.empty(B, H, LK, D, device=q.device, dtype=v.dtype)
-        _bwd_dkdv_kernel[lambda meta: (triton.cdiv(LK, meta["BLOCK_N"]), B * H)](
+        _bwd_dkdv_kernel[(triton.cdiv(LK, BN), B * H)](
             q, k, v, do, lse, delta, dk_f, dv_f,
             q.stride(0), q.stride(1), q.stride(2), q.stride(3),
             skb, skh, skn, skd, svb, svh, svn, svd,
@@ -329,7 +313,7 @@ def swa_sink_bwd(q, k, v, sink, o, lse, do, win_left, win_right, dense, scale,
             dk_f.stride(0), dk_f.stride(1), dk_f.stride(2), dk_f.stride(3),
             dv_f.stride(0), dv_f.stride(1), dv_f.stride(2), dv_f.stride(3),
             H, LQ, LK, win_left, win_right, scale,
-            WINDOWED=windowed, BLOCK_D=BLOCK_D, D=D,
+            WINDOWED=windowed, BLOCK_M=BM, BLOCK_N=BN, BLOCK_D=BLOCK_D, D=D,
         )
     dk = dk_f            # already in k/v dtype
     dv = dv_f
