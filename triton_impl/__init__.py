@@ -7,9 +7,10 @@ from .swa_sink_fwd import (
     swa_noncausal_sink_attn_fwd,  # forward-only symmetric-window compat wrapper (microbench)
 )
 from .swa_sink_ascend import swa_sink_attn_fwd_ascend  # NPU-shaped (1-D grid) forward
+from .swa_sink_ascend_bwd import swa_sink_bwd_ascend   # NPU-shaped (1-D grid) backward
 
 __all__ = [
     "swa_sink_attn", "dense_sink_attn",
     "swa_sink_attn_fwd", "dense_sink_attn_fwd", "swa_noncausal_sink_attn_fwd",
-    "swa_sink_attn_fwd_ascend",
+    "swa_sink_attn_fwd_ascend", "swa_sink_bwd_ascend",
 ]
