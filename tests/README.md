@@ -56,18 +56,31 @@ Optional variants:
 DTYPE=float32 python tests/test_forward_parity.py    # fp32 only (the correctness gate)
 ATOL=1e-6 RTOL=1e-6 python tests/test_forward_parity.py   # tighten tolerances yourself
 SEED=1 python tests/test_forward_parity.py           # different random inputs
+NO_REAL=1 python tests/test_forward_parity.py        # skip the heavy H=64,D=512 case
 ```
+
+Cases it runs (each vs the fp32 eager ref):
+- `[sym ]` symmetric microbench window (first-step form), H=8 D=64
+- `[asym]` the **real asymmetric** window `dspark_sas_window(block=7,window=128)=(L134,R6)`, toy H=8 D=64
+- `[real]` the asymmetric window at **real DSV4 shapes** H=64 D=512 (skip with `NO_REAL=1`)
+- `sink behaviour`: `sink->-inf` == plain windowed softmax; a finite sink diverts mass
+
+The `[real]` case uses small tiles (BLOCK=16) for shared-memory headroom on smaller GPUs.
+If it raises a shared-memory/compile error (not a math error), rerun with `NO_REAL=1` and
+tell me — that's a tile-size tuning issue, separate from correctness.
 
 ## 4. What to paste back
 
-Copy the **entire output**. It prints, per dtype, three rows plus a final PASS/FAIL:
+Copy the **entire output**. Each case (`[sym]`, `[asym]`, `[real]`, `sink behaviour`) prints
+one row per dtype, then a final PASS/FAIL:
 
 ```
-=== dtype=float32   allclose atol=1e-05 rtol=1e-05 ===
-[fwd ]  allclose=...  maxAbs=...  meanAbs=...  meanRel=...   OK/FAIL
-[sink0] sink->-inf == windowed softmax: allclose=...  maxAbs=...   OK/FAIL
-[sinkE] finite sink diverts mass: mean|o(sink)-o(-inf)|=...   OK/FAIL
-=== dtype=bfloat16  allclose atol=0.02 rtol=0.02 ===
+### [asym] real window, toy H/D   B=2 H=8 L=384 D=64  window=(L134,R6)  tile=(32,32)
+  [float32 ] allclose=...  maxAbs=...  meanAbs=...  meanRel=...  (atol=1e-05)  OK/FAIL
+  [bfloat16] allclose=...  maxAbs=...  meanAbs=...  meanRel=...  (atol=0.02)   OK/FAIL
+### sink behaviour   window=(L134,R6)  dtype=bfloat16
+  [sink0] sink->-inf == windowed softmax: allclose=...  maxAbs=...   OK/FAIL
+  [sinkE] finite sink diverts mass: mean|o(sink)-o(-inf)|=...   OK/FAIL
 ...
 PASS/FAIL
 ```
@@ -75,8 +88,8 @@ PASS/FAIL
 ## 5. How to read it (the two bars are intentional)
 
 - **float32 is the correctness gate.** The kernel forces `input_precision="ieee"` (true
-  fp32, no TF32), so `[fwd] maxAbs` should be **~1e-6**. That's the real signal the math
-  is right. If fp32 `maxAbs` is ~1e-3 → TF32 leaked in; ~1e-2 → a genuine math bug.
+  fp32, no TF32), so the `float32` row's `maxAbs` should be **~1e-6**. That's the real signal
+  the math is right. If fp32 `maxAbs` is ~1e-3 → TF32 leaked in; ~1e-2 → a genuine math bug.
 - **bfloat16 is deployment realism.** bf16 has an ~8-bit mantissa (~4e-3 relative), so a
   `maxAbs`/`meanAbs` around ~1e-2 vs the fp32 reference is the **format floor**, not a bug.
   That's why its tolerance is 2e-2 while fp32's is 1e-5.
