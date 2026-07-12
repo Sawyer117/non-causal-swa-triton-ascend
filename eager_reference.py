@@ -117,6 +117,24 @@ def swa_sink_attention(
     return _sink_softmax_pv(scores, sink, v, h, lq, lk, mla, compute_dtype)
 
 
+def swa_noncausal_sink_attention(
+    q, k, v, sink, window, scale=None, add_mask=None, compute_dtype=torch.float32,
+):
+    """[COMPAT] SYMMETRIC bidirectional window (win_left = win_right = window) + sink.
+
+    This is the isolated SWA microbench form (`dspark_swa_attn_bench.py`) and the target
+    of the first forward kernel in `triton_impl/`. Kept name-and-signature stable so that
+    kernel's parity test keeps importing it. NOTE: the REAL DSpark window is ASYMMETRIC
+    (see §4 / `dspark_sas_window`) -- for gold parity use `swa_sink_attention` with
+    `(win_left, win_right) = dspark_sas_window(block_size, window)`.
+    """
+    w = window if (window is not None and window > 0) else 10**9  # falsy -> full attn
+    return swa_sink_attention(
+        q, k, v, sink, win_left=w, win_right=w,
+        scale=scale, add_mask=add_mask, compute_dtype=compute_dtype,
+    )
+
+
 # ---------------------------------------------------------------------------
 # (B) BLOCK view -- the exact gold form (== _dspark_attention_reference).
 #     Per block the KV is already [window-context | full block]; attention is

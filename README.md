@@ -149,6 +149,14 @@ For completeness, the DFlash training path builds an even richer doc-aware packe
 before_anchor & in_window` on the context, full non-causal in-block). Keep the kernel general
 (window params, optional additive-mask input via `add_mask`) so it can express that too.
 
+> **Status note (symmetric first step → asymmetric gold).** The current `triton_impl/`
+> forward kernel + `tests/test_forward_parity.py` target the **symmetric** microbench window
+> (`swa_noncausal_sink_attention(window=W)`, `win_left = win_right = W`) — a valid first step.
+> To match the **real model** it must move to the **asymmetric** window
+> (`swa_sink_attention` + `dspark_sas_window`) at the real shapes (§3), and validate against
+> the vllm_ascend gold (`dspark_attn_ref_bench.py`). Both eager entry points live in
+> `eager_reference.py`; the symmetric one is a thin wrapper over the asymmetric one.
+
 ---
 
 ## 5. Why a fused kernel (the NPU gap)
