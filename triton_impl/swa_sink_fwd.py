@@ -53,7 +53,7 @@ def _swa_sink_fwd_kernel(
     stride_ob, stride_oh, stride_om, stride_od,
     H, LQ, LK, WIN_LEFT, WIN_RIGHT,
     scale,
-    WINDOWED: tl.constexpr,
+    WINDOWED: tl.constexpr, FP32_QK: tl.constexpr,
     BLOCK_M: tl.constexpr, BLOCK_N: tl.constexpr, BLOCK_D: tl.constexpr,
     D: tl.constexpr,
 ):
@@ -104,7 +104,12 @@ def _swa_sink_fwd_kernel(
         k_block = tl.load(k_ptrs, mask=k_mask, other=0.0)   # [BLOCK_N, BLOCK_D]
 
         # scores = q . k^T, fp32 accumulate; masked d-lanes are 0*0 so the dot is exact over D.
-        qk = tl.dot(q_block, tl.trans(k_block), input_precision="ieee").to(tl.float32) * qk_scale
+        qk = tl.dot(q_block, tl.trans(k_block), input_precision="ieee").to(tl.float32)
+        if not FP32_QK:
+            # round QK to the input dtype -> mimic the production eager path (torch
+            # einsum(bf16,bf16) rounds QK to bf16). No-op for fp32 inputs.
+            qk = qk.to(q_block.dtype).to(tl.float32)
+        qk = qk * qk_scale
 
         if WINDOWED:
             keep = ((offs_n[None, :] >= offs_m[:, None] - WIN_LEFT)
@@ -146,7 +151,8 @@ def _kv_strides(k):
     raise AssertionError("k/v must be [B,H,Lk,D] (MHA) or [B,Lk,D] (MLA-shared)")
 
 
-def _launch(q, k, v, sink, LQ, LK, win_left, win_right, windowed, scale, BLOCK_M, BLOCK_N):
+def _launch(q, k, v, sink, LQ, LK, win_left, win_right, windowed, scale, BLOCK_M, BLOCK_N,
+            fp32_qk=True):
     B, H, _, D = q.shape
     scale = D ** -0.5 if scale is None else scale
     sink = sink.to(torch.float32).contiguous()
@@ -163,36 +169,40 @@ def _launch(q, k, v, sink, LQ, LK, win_left, win_right, windowed, scale, BLOCK_M
         o.stride(0), o.stride(1), o.stride(2), o.stride(3),
         H, LQ, LK, win_left, win_right,
         scale,
-        WINDOWED=windowed,
+        WINDOWED=windowed, FP32_QK=fp32_qk,
         BLOCK_M=BLOCK_M, BLOCK_N=BLOCK_N, BLOCK_D=BLOCK_D, D=D,
     )
     return o
 
 
-def swa_sink_attn_fwd(q, k, v, sink, win_left, win_right, scale=None, BLOCK_M=32, BLOCK_N=32):
+def swa_sink_attn_fwd(q, k, v, sink, win_left, win_right, scale=None, BLOCK_M=32, BLOCK_N=32,
+                      fp32_qk=True):
     """Forward-only ASYMMETRIC windowed self-attention + sink (packed-SWA view). o [B,H,L,D].
 
     q [B,H,L,D]; k,v [B,H,L,D] (MHA) or [B,L,D] (MLA-shared). keep[i,j]=(j>=i-win_left)&(j<=
     i+win_right); use eager_reference.dspark_sas_window(block_size, window) for (win_left,
-    win_right). Validates against eager_reference.swa_sink_attention."""
+    win_right). fp32_qk=True (default) keeps fp32 QK accumulation; fp32_qk=False rounds QK to
+    the input dtype to mimic the production torch-eager path (bf16 einsum). Validates against
+    eager_reference.swa_sink_attention."""
     assert q.is_cuda, "kernel needs a CUDA (or Triton-capable) device"
     assert q.dim() == 4, "q must be [B,H,L,D]"
     assert win_left >= 0 and win_right >= 0, "window half-widths must be >= 0"
     L = q.shape[2]
-    return _launch(q, k, v, sink, L, L, win_left, win_right, True, scale, BLOCK_M, BLOCK_N)
+    return _launch(q, k, v, sink, L, L, win_left, win_right, True, scale, BLOCK_M, BLOCK_N, fp32_qk)
 
 
-def dense_sink_attn_fwd(q, k, v, sink, scale=None, BLOCK_M=32, BLOCK_N=32):
+def dense_sink_attn_fwd(q, k, v, sink, scale=None, BLOCK_M=32, BLOCK_N=32, fp32_qk=True):
     """Forward-only DENSE cross-attention + sink = the gold BLOCK form. o [B,H,Lq,D].
 
     q [B,H,Lq,D]; k,v [B,H,Lk,D] (MHA) or [B,Lk,D] (MLA-shared), Lq != Lk allowed. Every query
     attends to ALL Lk keys (no window). This reproduces dspark_block_attention_ref /
-    _dspark_attention_reference (feed the block as [N->B, H, BS->Lq, D] x [N, H, KV->Lk, D])."""
+    _dspark_attention_reference (feed the block as [N->B, H, BS->Lq, D] x [N, H, KV->Lk, D]).
+    fp32_qk as in swa_sink_attn_fwd."""
     assert q.is_cuda, "kernel needs a CUDA (or Triton-capable) device"
     assert q.dim() == 4, "q must be [B,H,Lq,D]"
     Lq = q.shape[2]
     Lk = k.shape[-2] if k.dim() == 4 else k.shape[1]
-    return _launch(q, k, v, sink, Lq, Lk, 0, 0, False, scale, BLOCK_M, BLOCK_N)
+    return _launch(q, k, v, sink, Lq, Lk, 0, 0, False, scale, BLOCK_M, BLOCK_N, fp32_qk)
 
 
 def swa_noncausal_sink_attn_fwd(q, k, v, sink, window, scale=None, BLOCK_M=32, BLOCK_N=32):
