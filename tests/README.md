@@ -55,8 +55,13 @@ python -c "import torch, triton; print('torch', torch.__version__, 'cuda', torch
 ## 3. Run
 
 ```bash
-python tests/test_forward_parity.py                 # runs BOTH fp32 and bf16
+python tests/test_forward_parity.py                 # forward: runs BOTH fp32 and bf16
+python tests/test_backward_parity.py                # backward: grads for q,k,v,sink vs the gold
 ```
+
+`test_backward_parity.py` exercises the autograd op (`swa_sink_attn` / `dense_sink_attn` —
+fast Triton forward + exact torch-autograd backward) and checks grad_{q,k,v,sink} against the
+eager/gold reference, same two bars (fp32 ~1e-6, bf16 ~1e-2), plus a small fp32 gradcheck.
 
 Optional variants:
 ```bash

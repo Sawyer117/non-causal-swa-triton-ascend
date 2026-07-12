@@ -37,6 +37,8 @@ import torch
 import triton
 import triton.language as tl
 
+from .torch_ref import torch_swa_sink_ref   # differentiable fp32 ref, for the (temporary) backward
+
 # 1/ln(2); folds exp(x) into exp2(x*LOG2E). Must be a tl.constexpr: Triton >=3.x forbids
 # @jit kernels from reading plain module globals (only constexpr globals are allowed).
 LOG2E = tl.constexpr(1.4426950408889634)
@@ -199,3 +201,49 @@ def swa_noncausal_sink_attn_fwd(q, k, v, sink, window, scale=None, BLOCK_M=32, B
     assert window is not None and window > 0, "symmetric wrapper needs a finite window > 0"
     return swa_sink_attn_fwd(q, k, v, sink, window, window, scale=scale,
                              BLOCK_M=BLOCK_M, BLOCK_N=BLOCK_N)
+
+
+# ---------------------------------------------------------------------------
+# Autograd wrapper: FAST Triton forward + (temporary) exact torch-autograd backward.
+# The backward recomputes the fp32 differentiable reference and lets torch autograd produce
+# grad_{q,k,v,sink} — correctness-first. Replacing this with a fused Triton backward kernel
+# (dq/dk/dv on the fly + dsink) is the next step; the public API here stays the same.
+# ---------------------------------------------------------------------------
+class _SwaSinkAttnFn(torch.autograd.Function):
+    @staticmethod
+    def forward(ctx, q, k, v, sink, win_left, win_right, scale, dense, BLOCK_M, BLOCK_N):
+        if dense:
+            o = dense_sink_attn_fwd(q, k, v, sink, scale=scale, BLOCK_M=BLOCK_M, BLOCK_N=BLOCK_N)
+        else:
+            o = swa_sink_attn_fwd(q, k, v, sink, win_left, win_right, scale=scale,
+                                  BLOCK_M=BLOCK_M, BLOCK_N=BLOCK_N)
+        ctx.save_for_backward(q, k, v, sink)
+        ctx.win_left, ctx.win_right, ctx.scale, ctx.dense = win_left, win_right, scale, dense
+        return o
+
+    @staticmethod
+    def backward(ctx, do):
+        q, k, v, sink = ctx.saved_tensors
+        with torch.enable_grad():
+            qd = q.detach().float().requires_grad_(True)
+            kd = k.detach().float().requires_grad_(True)
+            vd = v.detach().float().requires_grad_(True)
+            sd = sink.detach().float().requires_grad_(True)
+            o = torch_swa_sink_ref(qd, kd, vd, sd, ctx.win_left, ctx.win_right, ctx.scale, ctx.dense)
+            dq, dk, dv, ds = torch.autograd.grad(o, (qd, kd, vd, sd), grad_outputs=do.float())
+        # grads back in the inputs' dtypes; non-tensor args (win_left..BLOCK_N) get None
+        return (dq.to(q.dtype), dk.to(k.dtype), dv.to(v.dtype), ds.to(sink.dtype),
+                None, None, None, None, None, None)
+
+
+def swa_sink_attn(q, k, v, sink, win_left, win_right, scale=None, BLOCK_M=32, BLOCK_N=32):
+    """AUTOGRAD-CAPABLE asymmetric windowed self-attention + sink (fwd+bwd). o [B,H,L,D].
+    Fast Triton forward, exact torch-autograd backward (grads to q, k, v AND sink)."""
+    scale = q.shape[-1] ** -0.5 if scale is None else scale
+    return _SwaSinkAttnFn.apply(q, k, v, sink, win_left, win_right, scale, False, BLOCK_M, BLOCK_N)
+
+
+def dense_sink_attn(q, k, v, sink, scale=None, BLOCK_M=32, BLOCK_N=32):
+    """AUTOGRAD-CAPABLE dense cross-attention + sink = the gold BLOCK form (fwd+bwd). o [B,H,Lq,D]."""
+    scale = q.shape[-1] ** -0.5 if scale is None else scale
+    return _SwaSinkAttnFn.apply(q, k, v, sink, 0, 0, scale, True, BLOCK_M, BLOCK_N)
