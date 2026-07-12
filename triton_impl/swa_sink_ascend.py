@@ -120,6 +120,15 @@ def _kv_strides(t):
     return t.stride(0), 0, t.stride(1), t.stride(2)      # MLA-shared [B,Lk,D] -> head-stride 0
 
 
+def _default_blocks(D, block_m, block_n):
+    """Pick safe default tile sizes when unspecified: large head_dim (e.g. D=512) needs small
+    tiles to fit on-chip memory (GPU shared / Ascend UB). A3 perf tuning refines these."""
+    if block_m is not None and block_n is not None:
+        return block_m, block_n
+    bm, bn = (16, 16) if D >= 256 else (32, 32)
+    return (block_m or bm), (block_n or bn)
+
+
 def _num_cores(device):
     """Physical core count for the grid cap: num_aicore on Ascend, else the CUDA SM count."""
     try:
@@ -137,13 +146,15 @@ def _num_cores(device):
 
 
 def swa_sink_attn_fwd_ascend(q, k, v, sink, win_left, win_right, scale=None,
-                             dense=False, BLOCK_M=32, BLOCK_N=32, fp32_qk=True, num_programs=None):
+                             dense=False, BLOCK_M=None, BLOCK_N=None, fp32_qk=True, num_programs=None):
     """Ascend-shaped forward (1-D, core-capped grid-stride). Returns (o, lse). q [B,H,LQ,D];
     k,v [B,H,LK,D] (MHA) or [B,LK,D] (MLA). dense=True -> no window (Lq!=Lk allowed). Runs on CUDA
-    for validation. num_programs overrides the grid size (default = min(NUM_TILES, core count))."""
+    for validation. BLOCK_M/BLOCK_N default by head_dim (small for D>=256). num_programs overrides
+    the grid size (default = min(NUM_TILES, core count))."""
     assert q.dim() == 4, "q must be [B,H,LQ,D]"
     B, H, LQ, D = q.shape
     LK = k.shape[1] if k.dim() == 3 else k.shape[2]
+    BLOCK_M, BLOCK_N = _default_blocks(D, BLOCK_M, BLOCK_N)
     scale = D ** -0.5 if scale is None else scale
     sink = sink.to(torch.float32).contiguous()
     o = torch.empty_like(q)
