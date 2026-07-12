@@ -17,7 +17,7 @@ import torch
 import triton
 import triton.language as tl
 
-from .swa_sink_ascend import _kv_strides, _num_cores
+from .swa_sink_ascend import _kv_strides, _num_cores, swa_sink_attn_fwd_ascend
 
 LOG2E = tl.constexpr(1.4426950408889634)
 
@@ -323,3 +323,37 @@ def swa_sink_bwd_ascend(q, k, v, sink, o, lse, do, win_left, win_right, dense, s
     LOG2E_F = 1.4426950408889634
     dsink = -(torch.exp2(sink.float().view(1, H, 1) * LOG2E_F - lse) * delta).sum(dim=(0, 2))
     return dq, dk, dv, dsink.to(sink.dtype)
+
+
+# ---------------------------------------------------------------------------
+# Autograd wrapper: the complete Ascend-shaped fwd+bwd training op (mirrors the CUDA
+# _SwaSinkAttnFn but uses the 1-D-grid Ascend kernels). GPU-testable; A3-ready.
+# ---------------------------------------------------------------------------
+class _SwaSinkAscendFn(torch.autograd.Function):
+    @staticmethod
+    def forward(ctx, q, k, v, sink, win_left, win_right, scale, dense, BLOCK_M, BLOCK_N):
+        o, lse = swa_sink_attn_fwd_ascend(q, k, v, sink, win_left, win_right, scale=scale,
+                                          dense=dense, BLOCK_M=BLOCK_M, BLOCK_N=BLOCK_N)
+        ctx.save_for_backward(q, k, v, sink, o, lse)
+        ctx.win_left, ctx.win_right, ctx.scale, ctx.dense = win_left, win_right, scale, dense
+        ctx.BLOCK_M, ctx.BLOCK_N = BLOCK_M, BLOCK_N
+        return o
+
+    @staticmethod
+    def backward(ctx, do):
+        q, k, v, sink, o, lse = ctx.saved_tensors
+        dq, dk, dv, ds = swa_sink_bwd_ascend(q, k, v, sink, o, lse, do, ctx.win_left, ctx.win_right,
+                                             ctx.dense, ctx.scale, ctx.BLOCK_M, ctx.BLOCK_N)
+        return (dq, dk, dv, ds, None, None, None, None, None, None)
+
+
+def swa_sink_attn_ascend(q, k, v, sink, win_left, win_right, scale=None, BLOCK_M=32, BLOCK_N=32):
+    """AUTOGRAD Ascend-shaped windowed self-attention + sink (fwd+bwd). o [B,H,L,D]."""
+    scale = q.shape[-1] ** -0.5 if scale is None else scale
+    return _SwaSinkAscendFn.apply(q, k, v, sink, win_left, win_right, scale, False, BLOCK_M, BLOCK_N)
+
+
+def dense_sink_attn_ascend(q, k, v, sink, scale=None, BLOCK_M=32, BLOCK_N=32):
+    """AUTOGRAD Ascend-shaped dense cross-attention + sink = gold BLOCK form (fwd+bwd)."""
+    scale = q.shape[-1] ** -0.5 if scale is None else scale
+    return _SwaSinkAscendFn.apply(q, k, v, sink, 0, 0, scale, True, BLOCK_M, BLOCK_N)

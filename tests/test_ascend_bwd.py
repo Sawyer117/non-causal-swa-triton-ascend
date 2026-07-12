@@ -19,8 +19,9 @@ sys.path.insert(0, os.path.dirname(_HERE))
 from eager_reference import dspark_sas_window, DSV4  # noqa: E402
 try:
     from triton_impl.swa_sink_ascend import swa_sink_attn_fwd_ascend
-    from triton_impl.swa_sink_ascend_bwd import swa_sink_bwd_ascend
+    from triton_impl.swa_sink_ascend_bwd import swa_sink_bwd_ascend, swa_sink_attn_ascend
     from triton_impl.swa_sink_bwd import swa_sink_bwd            # validated CUDA reference
+    from triton_impl import swa_sink_attn                        # validated CUDA autograd op
 except Exception as e:  # noqa: BLE001
     print(f"!! import failed: {type(e).__name__}: {e}"); raise SystemExit(1)
 
@@ -71,6 +72,33 @@ def run(tag, B, H, L, D, wl, wr, *, mla=False, dense=False, N=None, BS=None, KV=
     return ok
 
 
+def run_autograd(wl, wr):
+    """The Ascend autograd op (swa_sink_attn_ascend) end-to-end grads must match the validated
+    CUDA autograd op (swa_sink_attn) — same kernels' math, only the grid differs."""
+    torch.manual_seed(0)
+    B, H, L, D = 2, 8, 384, 64
+    scale = D ** -0.5
+    print("\n### autograd op  (swa_sink_attn_ascend vs validated CUDA swa_sink_attn)")
+    ok = True
+    for dt in _DTYPES:
+        base = [torch.randn(B, H, L, D, device=_DEV, dtype=torch.float32) for _ in range(3)]
+        sink = torch.randn(H, device=_DEV, dtype=torch.float32)
+        do = torch.randn(B, H, L, D, device=_DEV, dtype=torch.float32)
+
+        def grads(fn):
+            xs = [t.to(dt).detach().clone().requires_grad_(True) for t in base]
+            s = sink.detach().clone().requires_grad_(True)
+            fn(xs[0], xs[1], xs[2], s, wl, wr, scale=scale).mul(do.to(dt)).sum().backward()
+            return [x.grad for x in xs] + [s.grad]
+
+        ga = grads(swa_sink_attn_ascend)
+        gc = grads(swa_sink_attn)
+        print(f"  dtype={str(dt).replace('torch.','')}")
+        for nm, a, b in zip("q k v sink".split(), ga, gc):
+            ok &= _cmp(nm, a, b)
+    return ok
+
+
 def main():
     if not torch.cuda.is_available():
         print("!! run on the GPU box"); raise SystemExit(1)
@@ -84,6 +112,7 @@ def main():
     ok &= run("[gold] dense", None, 8, None, 64, 0, 0, dense=True, N=4, BS=BS, KV=KV, bm=16, bn=16)
     ok &= run("[gold-mla] dense MLA", None, 8, None, 64, 0, 0, dense=True, mla=True, N=4, BS=BS, KV=KV, bm=16, bn=16)
     ok &= run("[real] DSV4 H=64 D=512", 1, DSV4["num_heads"], 256, DSV4["head_dim"], wl, wr, bm=16, bn=16)
+    ok &= run_autograd(wl, wr)
     print("\n" + ("PASS: 1-D-grid Ascend backward matches the CUDA backward."
                   if ok else "FAIL: see rows above."))
     raise SystemExit(0 if ok else 1)
