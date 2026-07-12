@@ -38,7 +38,7 @@ def _row(dt, o, ref):
     return close
 
 
-def run_windowed(tag, B, H, L, D, wl, wr, *, mla=False):
+def run_windowed(tag, B, H, L, D, wl, wr, *, mla=False, block_m=32, block_n=32):
     torch.manual_seed(0)
     scale = D ** -0.5
     q = torch.randn(B, H, L, D, device=_DEV, dtype=torch.float32)
@@ -46,13 +46,15 @@ def run_windowed(tag, B, H, L, D, wl, wr, *, mla=False):
     k = torch.randn(*ksh, device=_DEV, dtype=torch.float32)
     v = torch.randn(*ksh, device=_DEV, dtype=torch.float32)
     sink = torch.randn(H, device=_DEV, dtype=torch.float32)
-    print(f"\n### {tag}  B={B} H={H} L={L} D={D} window=(L{wl},R{wr}) {'MLA' if mla else 'MHA'}")
+    print(f"\n### {tag}  B={B} H={H} L={L} D={D} window=(L{wl},R{wr}) {'MLA' if mla else 'MHA'}  "
+          f"tile=({block_m},{block_n})")
     ok = True
     for dt in _DTYPES:
         qd, kd, vd = q.to(dt), k.to(dt), v.to(dt)
         ref = swa_sink_attention(qd.float(), kd.float(), vd.float(), sink, wl, wr,
                                  scale=scale, compute_dtype=torch.float32)
-        o, _ = swa_sink_attn_fwd_ascend(qd, kd, vd, sink, wl, wr, scale=scale)
+        o, _ = swa_sink_attn_fwd_ascend(qd, kd, vd, sink, wl, wr, scale=scale,
+                                        BLOCK_M=block_m, BLOCK_N=block_n)
         ok &= _row(dt, o, ref)
     return ok
 
@@ -122,7 +124,10 @@ def main():
     ok &= run_windowed("[asym-mla] windowed MLA", 2, 8, 384, 64, wl, wr, mla=True)
     ok &= run_dense("[gold] dense", 4, BS, KV, 8, 64)
     ok &= run_dense("[gold-mla] dense MLA", 4, BS, KV, 8, 64, mla=True)
-    ok &= run_windowed("[real] DSV4 H=64 D=512", 1, DSV4["num_heads"], 256, DSV4["head_dim"], wl, wr)
+    # real DSV4 D=512: small tiles for shared-memory headroom on smaller GPUs
+    ok &= run_windowed("[real] DSV4 H=64 D=512", 1, DSV4["num_heads"], 256, DSV4["head_dim"],
+                       wl, wr, block_m=16, block_n=16)
+    ok &= run_dense("[gold-real] DSV4 H=64 D=512", 2, BS, KV, DSV4["num_heads"], DSV4["head_dim"])
     print("\n" + ("PASS: 1-D-grid Ascend forward matches the reference."
                   if ok else "FAIL: see rows above."))
     raise SystemExit(0 if ok else 1)
