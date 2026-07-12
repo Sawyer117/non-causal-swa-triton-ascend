@@ -60,8 +60,9 @@ python tests/test_backward_parity.py                # backward: grads for q,k,v,
 ```
 
 `test_backward_parity.py` exercises the autograd op (`swa_sink_attn` / `dense_sink_attn` —
-fast Triton forward + exact torch-autograd backward) and checks grad_{q,k,v,sink} against the
-eager/gold reference, same two bars (fp32 ~1e-6, bf16 ~1e-2), plus a small fp32 gradcheck.
+fast Triton forward + **fused Triton backward** dq/dk/dv + torch dsink) and checks
+grad_{q,k,v,sink} against the eager/gold reference, same two bars (fp32 ~1e-6, bf16 ~1e-2),
+plus a small fp32 gradcheck. (The backward algorithm is CPU-validated vs autograd to ~1e-15.)
 
 Optional variants:
 ```bash

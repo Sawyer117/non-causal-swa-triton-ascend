@@ -37,7 +37,7 @@ import torch
 import triton
 import triton.language as tl
 
-from .torch_ref import torch_swa_sink_ref   # differentiable fp32 ref, for the (temporary) backward
+from .swa_sink_bwd import swa_sink_bwd      # fused Triton backward (dq/dk/dv + dsink)
 
 # 1/ln(2); folds exp(x) into exp2(x*LOG2E). Must be a tl.constexpr: Triton >=3.x forbids
 # @jit kernels from reading plain module globals (only constexpr globals are allowed).
@@ -46,7 +46,7 @@ LOG2E = tl.constexpr(1.4426950408889634)
 
 @triton.jit
 def _swa_sink_fwd_kernel(
-    Q, K, V, Sink, Out,
+    Q, K, V, Sink, Out, Lse,
     stride_qb, stride_qh, stride_qm, stride_qd,
     stride_kb, stride_kh, stride_kn, stride_kd,
     stride_vb, stride_vh, stride_vn, stride_vd,
@@ -140,6 +140,11 @@ def _swa_sink_fwd_kernel(
     o_mask = (offs_m[:, None] < LQ) & d_mask[None, :]
     tl.store(o_ptrs, o.to(Out.dtype.element_ty), mask=o_mask)
 
+    # logsumexp (log2 domain, incl. the sink) -> the backward recomputes p = exp2(qk2 - lse).
+    # Lse is [B, H, LQ] contiguous: offset = (b*H + h)*LQ + offs_m.
+    lse = m_i + tl.log2(l_i)                          # [BLOCK_M]
+    tl.store(Lse + (b * H + h) * LQ + offs_m, lse, mask=offs_m < LQ)
+
 
 def _kv_strides(k):
     """Strides (b, h, n, d) for K/V that may be MHA [B,H,Lk,D] or MLA-shared [B,Lk,D].
@@ -153,16 +158,18 @@ def _kv_strides(k):
 
 def _launch(q, k, v, sink, LQ, LK, win_left, win_right, windowed, scale, BLOCK_M, BLOCK_N,
             fp32_qk=True):
+    """Returns (o, lse). lse [B,H,LQ] fp32 = m + log2(l) (incl. sink) for the backward."""
     B, H, _, D = q.shape
     scale = D ** -0.5 if scale is None else scale
     sink = sink.to(torch.float32).contiguous()
     o = torch.empty_like(q)
+    lse = torch.empty(B, H, LQ, device=q.device, dtype=torch.float32)
     BLOCK_D = triton.next_power_of_2(D)
     skb, skh, skn, skd = _kv_strides(k)
     svb, svh, svn, svd = _kv_strides(v)
     grid = (triton.cdiv(LQ, BLOCK_M), B * H)
     _swa_sink_fwd_kernel[grid](
-        q, k, v, sink, o,
+        q, k, v, sink, o, lse,
         q.stride(0), q.stride(1), q.stride(2), q.stride(3),
         skb, skh, skn, skd,
         svb, svh, svn, svd,
@@ -172,7 +179,7 @@ def _launch(q, k, v, sink, LQ, LK, win_left, win_right, windowed, scale, BLOCK_M
         WINDOWED=windowed, FP32_QK=fp32_qk,
         BLOCK_M=BLOCK_M, BLOCK_N=BLOCK_N, BLOCK_D=BLOCK_D, D=D,
     )
-    return o
+    return o, lse
 
 
 def swa_sink_attn_fwd(q, k, v, sink, win_left, win_right, scale=None, BLOCK_M=32, BLOCK_N=32,
@@ -188,7 +195,7 @@ def swa_sink_attn_fwd(q, k, v, sink, win_left, win_right, scale=None, BLOCK_M=32
     assert q.dim() == 4, "q must be [B,H,L,D]"
     assert win_left >= 0 and win_right >= 0, "window half-widths must be >= 0"
     L = q.shape[2]
-    return _launch(q, k, v, sink, L, L, win_left, win_right, True, scale, BLOCK_M, BLOCK_N, fp32_qk)
+    return _launch(q, k, v, sink, L, L, win_left, win_right, True, scale, BLOCK_M, BLOCK_N, fp32_qk)[0]
 
 
 def dense_sink_attn_fwd(q, k, v, sink, scale=None, BLOCK_M=32, BLOCK_N=32, fp32_qk=True):
@@ -202,7 +209,7 @@ def dense_sink_attn_fwd(q, k, v, sink, scale=None, BLOCK_M=32, BLOCK_N=32, fp32_
     assert q.dim() == 4, "q must be [B,H,Lq,D]"
     Lq = q.shape[2]
     Lk = k.shape[-2] if k.dim() == 4 else k.shape[1]
-    return _launch(q, k, v, sink, Lq, Lk, 0, 0, False, scale, BLOCK_M, BLOCK_N, fp32_qk)
+    return _launch(q, k, v, sink, Lq, Lk, 0, 0, False, scale, BLOCK_M, BLOCK_N, fp32_qk)[0]
 
 
 def swa_noncausal_sink_attn_fwd(q, k, v, sink, window, scale=None, BLOCK_M=32, BLOCK_N=32):
@@ -222,28 +229,22 @@ def swa_noncausal_sink_attn_fwd(q, k, v, sink, window, scale=None, BLOCK_M=32, B
 class _SwaSinkAttnFn(torch.autograd.Function):
     @staticmethod
     def forward(ctx, q, k, v, sink, win_left, win_right, scale, dense, BLOCK_M, BLOCK_N):
-        if dense:
-            o = dense_sink_attn_fwd(q, k, v, sink, scale=scale, BLOCK_M=BLOCK_M, BLOCK_N=BLOCK_N)
-        else:
-            o = swa_sink_attn_fwd(q, k, v, sink, win_left, win_right, scale=scale,
-                                  BLOCK_M=BLOCK_M, BLOCK_N=BLOCK_N)
-        ctx.save_for_backward(q, k, v, sink)
+        Lk = (k.shape[2] if k.dim() == 4 else k.shape[1])
+        LQ = q.shape[2]
+        wl, wr = (0, 0) if dense else (win_left, win_right)
+        o, lse = _launch(q, k, v, sink, LQ, Lk, wl, wr, not dense, scale, BLOCK_M, BLOCK_N)
+        ctx.save_for_backward(q, k, v, sink, o, lse)
         ctx.win_left, ctx.win_right, ctx.scale, ctx.dense = win_left, win_right, scale, dense
+        ctx.BLOCK_M, ctx.BLOCK_N = BLOCK_M, BLOCK_N
         return o
 
     @staticmethod
     def backward(ctx, do):
-        q, k, v, sink = ctx.saved_tensors
-        with torch.enable_grad():
-            qd = q.detach().float().requires_grad_(True)
-            kd = k.detach().float().requires_grad_(True)
-            vd = v.detach().float().requires_grad_(True)
-            sd = sink.detach().float().requires_grad_(True)
-            o = torch_swa_sink_ref(qd, kd, vd, sd, ctx.win_left, ctx.win_right, ctx.scale, ctx.dense)
-            dq, dk, dv, ds = torch.autograd.grad(o, (qd, kd, vd, sd), grad_outputs=do.float())
-        # grads back in the inputs' dtypes; non-tensor args (win_left..BLOCK_N) get None
-        return (dq.to(q.dtype), dk.to(k.dtype), dv.to(v.dtype), ds.to(sink.dtype),
-                None, None, None, None, None, None)
+        q, k, v, sink, o, lse = ctx.saved_tensors
+        dq, dk, dv, ds = swa_sink_bwd(q, k, v, sink, o, lse, do, ctx.win_left, ctx.win_right,
+                                      ctx.dense, ctx.scale, ctx.BLOCK_M, ctx.BLOCK_N)
+        # non-tensor args (win_left..BLOCK_N) get None
+        return (dq, dk, dv, ds, None, None, None, None, None, None)
 
 
 def swa_sink_attn(q, k, v, sink, win_left, win_right, scale=None, BLOCK_M=32, BLOCK_N=32):
