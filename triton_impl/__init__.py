@@ -6,8 +6,10 @@ from .swa_sink_fwd import (
     dense_sink_attn_fwd,       # forward-only: dense cross-attention + sink (gold BLOCK form)
     swa_noncausal_sink_attn_fwd,  # forward-only symmetric-window compat wrapper (microbench)
 )
+from .swa_sink_ascend import swa_sink_attn_fwd_ascend  # NPU-shaped (1-D grid) forward
 
 __all__ = [
     "swa_sink_attn", "dense_sink_attn",
     "swa_sink_attn_fwd", "dense_sink_attn_fwd", "swa_noncausal_sink_attn_fwd",
+    "swa_sink_attn_fwd_ascend",
 ]
