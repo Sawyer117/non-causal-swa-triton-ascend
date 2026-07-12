@@ -52,6 +52,12 @@ def _peak(step):
     return torch.cuda.max_memory_allocated() / 1e6
 
 
+def _prec(o, ref):
+    """maxAbs / meanRel of an ascend output vs the fp32 reference on the same inputs."""
+    d = (o.float() - ref.float()).abs()
+    return d.max().item(), (d / (ref.abs() + 1e-6)).mean().item()
+
+
 def _run(fwd, fb):
     try:
         fb(); torch.cuda.synchronize()
@@ -96,6 +102,12 @@ def bench_windowed(B, H, L, D, wl, wr):
         return s
 
     print(f"\n### windowed  B={B} H={H} L={L} D={D}  window=(L{wl},R{wr})  dtype={DT}  tile=({bm},{bn})")
+    with torch.no_grad():
+        o_a, _ = swa_sink_attn_fwd_ascend(q, k, v, sink, wl, wr, scale=scale, BLOCK_M=bm, BLOCK_N=bn)
+    ref = swa_sink_attention(q.float(), k.float(), v.float(), sink, wl, wr, scale=scale,
+                             compute_dtype=torch.float32)
+    mx, mr = _prec(o_a, ref)
+    print(f"    precision     vs eager(fp32, same inputs):  maxAbs={mx:.2e}  meanRel={mr:.2e}")
     eag = _run(eager_fwd, eager_fb)
     if eag:
         print(f"    eager         fwd={eag[0]:7.3f}ms  fwd+bwd={eag[1]:7.3f}ms  peak={eag[2]:8.1f}MB")
@@ -146,6 +158,15 @@ def bench_dense_mla(N, BS, KV, H, D):
         return s
 
     print(f"\n### dense MLA (production)  N={N} BS={BS} KV={KV} H={H} D={D}  dtype={DT}  tile=({bm},{bn})")
+    with torch.no_grad():
+        o_a, _ = swa_sink_attn_fwd_ascend(qk, kL, vL, sink, 0, 0, scale=scale, dense=True,
+                                          BLOCK_M=bm, BLOCK_N=bn)
+    ref = dspark_block_attention_ref(qk.transpose(1, 2).float(),
+                                     kL.float().unsqueeze(2).expand(N, KV, H, D),
+                                     vL.float().unsqueeze(2).expand(N, KV, H, D), sink,
+                                     scale=scale, compute_dtype=torch.float32)  # [N,BS,H,D]
+    mx, mr = _prec(o_a.transpose(1, 2), ref)
+    print(f"    precision     vs gold(fp32, same inputs):  maxAbs={mx:.2e}  meanRel={mr:.2e}")
     eag = _run(eager_fwd, eager_fb)
     if eag:
         print(f"    eager         fwd={eag[0]:7.3f}ms  fwd+bwd={eag[1]:7.3f}ms  peak={eag[2]:8.1f}MB")
