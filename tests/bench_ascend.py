@@ -19,6 +19,11 @@ import time
 import torch
 import triton
 
+try:  # Ascend: maps torch.cuda.* -> NPU so this bench runs on the A3 too (vllm PR #775)
+    from torch_npu.contrib import transfer_to_npu  # noqa: F401
+except Exception:  # noqa: BLE001
+    pass
+
 _HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, os.path.dirname(_HERE))
 from eager_reference import (  # noqa: E402

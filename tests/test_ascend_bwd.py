@@ -20,8 +20,8 @@ sys.path.insert(0, os.path.dirname(_HERE))
 from eager_reference import (  # noqa: E402
     swa_sink_attention, dspark_block_attention_ref, dspark_sas_window, DSV4,
 )
-try:
-    import torch_npu  # noqa: F401  (registers the npu device on Ascend)
+try:  # Ascend: maps torch.cuda.* -> NPU so "cuda"/torch.cuda.* work transparently (vllm PR #775)
+    from torch_npu.contrib import transfer_to_npu  # noqa: F401
 except Exception:  # noqa: BLE001
     pass
 try:
@@ -30,8 +30,7 @@ try:
 except Exception as e:  # noqa: BLE001
     print(f"!! import failed: {type(e).__name__}: {e}"); raise SystemExit(1)
 
-_DEV = ("cuda" if torch.cuda.is_available()
-        else "npu" if (hasattr(torch, "npu") and torch.npu.is_available()) else None)
+_DEV = "cuda" if torch.cuda.is_available() else None   # "cuda" == the Ascend NPU after the shim
 _TOL = {torch.float32: (1e-5, 1e-5), torch.bfloat16: (2e-2, 2e-2)}
 _DTYPES = ([{"bfloat16": torch.bfloat16, "float32": torch.float32}[os.environ["DTYPE"]]]
            if "DTYPE" in os.environ else [torch.float32, torch.bfloat16])
