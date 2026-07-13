@@ -411,7 +411,7 @@ def _bwd_dkdv_mla_dense_ascend_kernel(
 
 
 def _swa_sink_bwd_mla_dense(q, k, v, sink, o, lse, do, scale, num_programs=None,
-                            BM_DQ=None, BK_DQ=None, BM_DKDV=None, BLOCK_KV=None):
+                            BM_DQ=None, BK_DQ=None, BM_DKDV=None, BLOCK_KV=None, pv_prec=None):
     """D-tiled / row-tiled MLA-dense backward (the DEFAULT dense-MLA path). q [N,H,BS,D]; k,v latent
     [N,KV,D]. Returns (dq,dk,dv,dsink). dq D-tiles the head dim (big BLOCK_M rows); dk/dv tiles the
     key dim (BLOCK_KV) and sums over row-tiles (holds dk_acc/dv_acc[BLOCK_KV,D] + Q/DO in the UB)."""
@@ -428,7 +428,7 @@ def _swa_sink_bwd_mla_dense(q, k, v, sink, o, lse, do, scale, num_programs=None,
     lse = lse.contiguous()
     delta = (do.float() * o.float()).sum(-1).contiguous()
     BLOCK_D = triton.next_power_of_2(D)
-    pv_fp16 = (q.dtype == torch.bfloat16)   # bf16 inputs -> fp16 for the 2nd-level dots (8x tighter grad)
+    pv_fp16 = (pv_prec == "fp16") and (q.dtype == torch.bfloat16)   # opt-in fp16 2nd-level dots (default bf16)
     ncores = _num_cores(q.device)
 
     def gsize(nt):
@@ -474,7 +474,7 @@ def _swa_sink_bwd_mla_dense(q, k, v, sink, o, lse, do, scale, num_programs=None,
 
 def swa_sink_bwd_ascend(q, k, v, sink, o, lse, do, win_left, win_right, dense, scale,
                         BLOCK_M=None, BLOCK_N=None, num_programs=None, HG=None,
-                        BM_DQ=None, BK_DQ=None, BM_DKDV=None, BLOCK_KV=None):
+                        BM_DQ=None, BK_DQ=None, BM_DKDV=None, BLOCK_KV=None, pv_prec=None):
     """Ascend-shaped fused backward (1-D core-capped grid-stride). Returns (dq, dk, dv, dsink).
     Same signature/semantics as swa_sink_bwd; GPU-testable. BLOCK_M/BLOCK_N default by head_dim.
 
@@ -483,7 +483,8 @@ def swa_sink_bwd_ascend(q, k, v, sink, o, lse, do, win_left, win_right, dense, s
     Windowed / MHA keep the validated per-(b,h) kernels. HG is accepted for API compat (ignored)."""
     if dense and k.dim() == 3:
         return _swa_sink_bwd_mla_dense(q, k, v, sink, o, lse, do, scale, num_programs=num_programs,
-                                       BM_DQ=BM_DQ, BK_DQ=BK_DQ, BM_DKDV=BM_DKDV, BLOCK_KV=BLOCK_KV)
+                                       BM_DQ=BM_DQ, BK_DQ=BK_DQ, BM_DKDV=BM_DKDV, BLOCK_KV=BLOCK_KV,
+                                       pv_prec=pv_prec)
     B, H, LQ, D = q.shape
     BLOCK_M, BLOCK_N = _default_blocks(D, BLOCK_M, BLOCK_N)
     BLOCK_M, BLOCK_N = _bwd_safe_blocks(D, BLOCK_M, BLOCK_N)   # keep K+V (x multi-buffer) in L1

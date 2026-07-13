@@ -72,7 +72,9 @@ BM = int(os.environ["BM"]) if "BM" in os.environ else None   # fwd rows per tile
 BN = int(os.environ["BN"]) if "BN" in os.environ else None   # (legacy flash key-block; unused by D-tiled fwd)
 HG = int(os.environ["HG"]) if "HG" in os.environ else None   # alias: BLOCK_M = next_pow2(HG*BS)
 BK = int(os.environ["BK"]) if "BK" in os.environ else None   # fwd D-tile (BLOCK_K, default 128)
-PVP = "fp32" if os.environ.get("PVF32") else "fp16"          # P@V precision: fp16 default; PVF32=1 -> exact fp32
+# P@V precision DEFAULT = bf16 (faithful drop-in for the bf16 production op). Opt-in: PVF16=1 (fp16,
+# 8x tighter, same speed) or PVF32=1 (exact fp32, slower).
+PVP = "fp32" if os.environ.get("PVF32") else ("fp16" if os.environ.get("PVF16") else None)
 # backward tile knobs (sweep on the A3): dq rows / dq D-tile / dk,dv rows / dk,dv key-tile
 BMDQ = int(os.environ["BMDQ"]) if "BMDQ" in os.environ else None
 BKDQ = int(os.environ["BKDQ"]) if "BKDQ" in os.environ else None
@@ -124,7 +126,8 @@ def ours_fb():
                                       BLOCK_M=BM, HG=HG, BLOCK_K=BK, pv_prec=PVP)
     # backward is the D-tiled/row-tiled MLA-dense path; BMDQ/BKDQ/BMKV/BKV env sweep its tiles.
     swa_sink_bwd_ascend(qk, KL, VL, SINK, o, lse, DO.transpose(1, 2).contiguous(),
-                        0, 0, True, SCALE, BM_DQ=BMDQ, BK_DQ=BKDQ, BM_DKDV=BMKV, BLOCK_KV=BKV)
+                        0, 0, True, SCALE, BM_DQ=BMDQ, BK_DQ=BKDQ, BM_DKDV=BMKV, BLOCK_KV=BKV,
+                        pv_prec=PVP)
 
 
 def cmp(x, ref):

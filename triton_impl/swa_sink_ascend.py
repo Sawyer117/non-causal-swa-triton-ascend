@@ -187,7 +187,7 @@ def _swa_sink_fwd_mla_dense_kernel(
 
 
 def swa_sink_attn_fwd_mla_dense_ascend(q, k, v, sink, scale=None, HG=None, BLOCK_M=None,
-                                       BLOCK_K=None, num_programs=None, pv_prec="fp16"):
+                                       BLOCK_K=None, num_programs=None, pv_prec=None):
     """D-tiled MLA-dense forward. q [N,H,BS,D]; k,v latent [N,KV,D]; sink [H]. Returns (o, lse) in the
     SAME layout/format as swa_sink_attn_fwd_ascend (o [N,H,BS,D], lse [N,H,BS]) so the backward
     consumes it unchanged. BLOCK_M = flattened (head,query) rows per program (M axis; the Cube-fill
@@ -208,7 +208,8 @@ def swa_sink_attn_fwd_mla_dense_ascend(q, k, v, sink, scale=None, HG=None, BLOCK
     BLOCK_M = min(BLOCK_M, triton.next_power_of_2(HR))
     BLOCK_K = 128 if BLOCK_K is None else BLOCK_K    # D-tile (512B-aligned; keeps [*,BK] on chip)
     BLOCK_N = KV                                     # KV=135 in one shot (tiny), single-pass softmax
-    # P@V precision: fp16 (default; 8x tighter than bf16, same speed) / fp32 (exact, slower) / bf16.
+    # P@V precision: DEFAULT matches the input dtype (bf16 -> faithful drop-in for the bf16 production
+    # op). Opt-in: pv_prec="fp16" (8x tighter, same Cube speed) or "fp32" (exact, slower).
     pv_fp32 = (pv_prec == "fp32")
     pv_fp16 = (pv_prec == "fp16") and (v.dtype == torch.bfloat16)
     num_m_tiles = triton.cdiv(HR, BLOCK_M)
@@ -260,7 +261,7 @@ def _num_cores(device):
 
 def swa_sink_attn_fwd_ascend(q, k, v, sink, win_left, win_right, scale=None,
                              dense=False, BLOCK_M=None, BLOCK_N=None, fp32_qk=True, num_programs=None,
-                             HG=None, BLOCK_K=None, pv_prec="fp16"):
+                             HG=None, BLOCK_K=None, pv_prec=None):
     """Ascend-shaped forward (1-D, core-capped grid-stride). Returns (o, lse). q [B,H,LQ,D];
     k,v [B,H,LK,D] (MHA) or [B,LK,D] (MLA). dense=True -> no window (Lq!=Lk allowed). Runs on CUDA
     for validation. BLOCK_M/BLOCK_N default by head_dim (small for D>=256). num_programs overrides
