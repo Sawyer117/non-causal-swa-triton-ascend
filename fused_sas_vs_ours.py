@@ -55,6 +55,8 @@ D = int(os.environ.get("D", "512"))
 KV = WIN + BS
 SCALE = D ** -0.5
 NITER = 20
+BM = int(os.environ["BM"]) if "BM" in os.environ else None   # tile override (perf tuning on the A3)
+BN = int(os.environ["BN"]) if "BN" in os.environ else None   # e.g. BN=128 -> KV in one key-block
 
 mm, wl, wr = _dspark_sas_window(BS, WIN)
 print(f">>> OUR Ascend op vs vllm_ascend GOLD  (_dspark_attention_reference)")
@@ -91,15 +93,16 @@ def manual():
 
 def ours_fwd():
     o, _ = swa_sink_attn_fwd_ascend(Q.transpose(1, 2).contiguous(), KL, VL, SINK, 0, 0,
-                                    scale=SCALE, dense=True)               # [N,H,BS,D]
+                                    scale=SCALE, dense=True, BLOCK_M=BM, BLOCK_N=BN)  # [N,H,BS,D]
     return o.transpose(1, 2)                                              # [N,BS,H,D]
 
 
 def ours_fb():
     qk = Q.transpose(1, 2).contiguous()
-    o, lse = swa_sink_attn_fwd_ascend(qk, KL, VL, SINK, 0, 0, scale=SCALE, dense=True)
+    o, lse = swa_sink_attn_fwd_ascend(qk, KL, VL, SINK, 0, 0, scale=SCALE, dense=True,
+                                      BLOCK_M=BM, BLOCK_N=BN)
     swa_sink_bwd_ascend(qk, KL, VL, SINK, o, lse, DO.transpose(1, 2).contiguous(),
-                        0, 0, True, SCALE)
+                        0, 0, True, SCALE, BLOCK_M=BM, BLOCK_N=BN)
 
 
 def cmp(x, ref):
