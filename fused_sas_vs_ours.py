@@ -28,6 +28,10 @@ PERF TUNING (MLA-dense uses the D-tiled kernel by default; the forward was Cube-
   rows against the same K/V. KV=135 is tiny -> single-pass softmax (full scores[M,135]). D=512 is
   TILED by BLOCK_K in both matmuls, so nothing [*,512] is on chip (no more UB/cbuf overflow) and M
   can grow. Sweep BM in {32,64,128,256}, BK in {64,128,256}. HG=n is an alias (BLOCK_M=next_pow2(n*BS)).
+
+BACKWARD tuning (it dominates fwd+bwd): BMDQ = dq rows/tile (dq holds qk+dp fp32 -> ~32 safe),
+BKDQ = dq D-tile, BMKV = dk/dv rows/tile, BKV = dk/dv key-tile (bigger = fewer Q/DO re-reads but
+bigger dk_acc; capped ~16 at D=512). e.g.  BMKV=32 python fused_sas_vs_ours.py   /   BKV=16 BMKV=24 ...
 """
 import os
 import time
@@ -68,6 +72,11 @@ BM = int(os.environ["BM"]) if "BM" in os.environ else None   # fwd rows per tile
 BN = int(os.environ["BN"]) if "BN" in os.environ else None   # (legacy flash key-block; unused by D-tiled fwd)
 HG = int(os.environ["HG"]) if "HG" in os.environ else None   # alias: BLOCK_M = next_pow2(HG*BS)
 BK = int(os.environ["BK"]) if "BK" in os.environ else None   # fwd D-tile (BLOCK_K, default 128)
+# backward tile knobs (sweep on the A3): dq rows / dq D-tile / dk,dv rows / dk,dv key-tile
+BMDQ = int(os.environ["BMDQ"]) if "BMDQ" in os.environ else None
+BKDQ = int(os.environ["BKDQ"]) if "BKDQ" in os.environ else None
+BMKV = int(os.environ["BMKV"]) if "BMKV" in os.environ else None
+BKV = int(os.environ["BKV"]) if "BKV" in os.environ else None
 
 mm, wl, wr = _dspark_sas_window(BS, WIN)
 print(f">>> OUR Ascend op vs vllm_ascend GOLD  (_dspark_attention_reference)")
@@ -112,9 +121,9 @@ def ours_fb():
     qk = Q.transpose(1, 2).contiguous()
     o, lse = swa_sink_attn_fwd_ascend(qk, KL, VL, SINK, 0, 0, scale=SCALE, dense=True,
                                       BLOCK_M=BM, HG=HG, BLOCK_K=BK)
-    # backward is now the D-tiled/row-tiled MLA-dense path by default (its own internal tiles).
+    # backward is the D-tiled/row-tiled MLA-dense path; BMDQ/BKDQ/BMKV/BKV env sweep its tiles.
     swa_sink_bwd_ascend(qk, KL, VL, SINK, o, lse, DO.transpose(1, 2).contiguous(),
-                        0, 0, True, SCALE)
+                        0, 0, True, SCALE, BM_DQ=BMDQ, BK_DQ=BKDQ, BM_DKDV=BMKV, BLOCK_KV=BKV)
 
 
 def cmp(x, ref):
