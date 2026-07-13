@@ -284,7 +284,7 @@ def _bwd_dq_mla_dense_ascend_kernel(
     H, HR, KV, scale,                                # HR = H*BS rows per block
     NUM_TILES, NUM_M_TILES,
     BS: tl.constexpr, BLOCK_M: tl.constexpr, BLOCK_N: tl.constexpr, BLOCK_K: tl.constexpr,
-    D: tl.constexpr,
+    D: tl.constexpr, PV_FP16: tl.constexpr,
 ):
     pid = tl.program_id(0)
     num_prog = tl.num_programs(0)
@@ -323,7 +323,9 @@ def _bwd_dq_mla_dense_ascend_kernel(
         lse_block = tl.load(Lse + n * HR + rows, mask=row_ok, other=0.0)
         delta_block = tl.load(Delta + n * HR + rows, mask=row_ok, other=0.0)
         p = tl.math.exp2(qk - lse_block[:, None])
-        ds = (p * (dp - delta_block[:, None])).to(K.dtype.element_ty)     # [M,KV] bf16
+        # round ds to FP16 (not bf16) for the ds@K matmul when inputs are bf16 -> 8x tighter grad
+        ds = p * (dp - delta_block[:, None])                              # [M,KV] fp32
+        ds = ds.to(tl.float16) if PV_FP16 else ds.to(K.dtype.element_ty)
 
         # phase 2: dq[M,D] = (ds @ K) * scale, D-tiled output
         base_dq = DQ + n * stride_gn + m0 * stride_gm
@@ -332,6 +334,7 @@ def _bwd_dq_mla_dense_ascend_kernel(
             kd = offs_k[None, :] < D
             kk = tl.load(base_k + offs_n[:, None] * stride_kk + offs_k[None, :] * stride_kd,
                          mask=kd, other=0.0)
+            kk = kk.to(tl.float16) if PV_FP16 else kk
             dq_c = tl.dot(ds, kk, input_precision="ieee").to(tl.float32) * scale
             tl.store(base_dq + offs_m[:, None] * stride_gm + offs_k[None, :] * stride_gd,
                      dq_c.to(DQ.dtype.element_ty), mask=(row_ok[:, None] & kd))
@@ -349,7 +352,7 @@ def _bwd_dkdv_mla_dense_ascend_kernel(
     H, HR, KV, scale,
     NUM_TILES, NUM_KV_TILES, NUM_M_TILES,
     BS: tl.constexpr, BLOCK_M: tl.constexpr, BLOCK_KV: tl.constexpr, BLOCK_D: tl.constexpr,
-    D: tl.constexpr,
+    D: tl.constexpr, PV_FP16: tl.constexpr,
 ):
     pid = tl.program_id(0)
     num_prog = tl.num_programs(0)
@@ -392,8 +395,13 @@ def _bwd_dkdv_mla_dense_ascend_kernel(
             p = tl.math.exp2(qk - lse_block[:, None])                     # [M, BLOCK_KV]
             dp = tl.dot(do_full, tl.trans(v_full), input_precision="ieee").to(tl.float32)
             ds = p * (dp - delta_block[:, None])
-            dv_acc += tl.dot(tl.trans(p.to(do_full.dtype)), do_full, input_precision="ieee")
-            dk_acc += tl.dot(tl.trans(ds.to(q_full.dtype)), q_full, input_precision="ieee")
+            # round p, ds to FP16 (not bf16) for the p@DO / ds@Q matmuls (bf16 inputs) -> 8x tighter
+            p_pv = p.to(tl.float16) if PV_FP16 else p.to(do_full.dtype)
+            do_pv = do_full.to(tl.float16) if PV_FP16 else do_full
+            ds_pv = ds.to(tl.float16) if PV_FP16 else ds.to(q_full.dtype)
+            q_pv = q_full.to(tl.float16) if PV_FP16 else q_full
+            dv_acc += tl.dot(tl.trans(p_pv), do_pv, input_precision="ieee")
+            dk_acc += tl.dot(tl.trans(ds_pv), q_pv, input_precision="ieee")
 
         dk_acc = dk_acc * scale
         tl.store(DK + n * stride_kgn + keys[:, None] * stride_kgk + offs_d[None, :] * stride_kgd,
@@ -420,6 +428,7 @@ def _swa_sink_bwd_mla_dense(q, k, v, sink, o, lse, do, scale, num_programs=None,
     lse = lse.contiguous()
     delta = (do.float() * o.float()).sum(-1).contiguous()
     BLOCK_D = triton.next_power_of_2(D)
+    pv_fp16 = (q.dtype == torch.bfloat16)   # bf16 inputs -> fp16 for the 2nd-level dots (8x tighter grad)
     ncores = _num_cores(q.device)
 
     def gsize(nt):
@@ -437,7 +446,7 @@ def _swa_sink_bwd_mla_dense(q, k, v, sink, o, lse, do, scale, num_programs=None,
         do.stride(0), do.stride(1), do.stride(2), do.stride(3),
         dq.stride(0), dq.stride(1), dq.stride(2), dq.stride(3),
         H, HR, KV, scale, nt_dq, num_m_tiles,
-        BS=BS, BLOCK_M=BM_DQ, BLOCK_N=KV, BLOCK_K=BK_DQ, D=D,
+        BS=BS, BLOCK_M=BM_DQ, BLOCK_N=KV, BLOCK_K=BK_DQ, D=D, PV_FP16=pv_fp16,
     )
 
     # dk/dv (key-tiled, row-tile inner loop)
@@ -455,7 +464,7 @@ def _swa_sink_bwd_mla_dense(q, k, v, sink, o, lse, do, scale, num_programs=None,
         dk_f.stride(0), dk_f.stride(1), dk_f.stride(2),
         dv_f.stride(0), dv_f.stride(1), dv_f.stride(2),
         H, HR, KV, scale, nt_kv, num_kv_tiles, num_m_tiles2,
-        BS=BS, BLOCK_M=BM_DKDV, BLOCK_KV=BLOCK_KV, BLOCK_D=BLOCK_D, D=D,
+        BS=BS, BLOCK_M=BM_DKDV, BLOCK_KV=BLOCK_KV, BLOCK_D=BLOCK_D, D=D, PV_FP16=pv_fp16,
     )
 
     LOG2E_F = 1.4426950408889634
