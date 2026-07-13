@@ -64,12 +64,13 @@ def run_windowed(tag, B, H, L, D, wl, wr, *, mla=False, block_m=32, block_n=32):
     return ok
 
 
-def run_dense(tag, N, BS, KV, H, D, *, mla=False):
+def run_dense(tag, N, BS, KV, H, D, *, mla=False, hg=None):
     torch.manual_seed(0)
     scale = D ** -0.5
     qg = torch.randn(N, BS, H, D, device=_DEV, dtype=torch.float32)
     sink = torch.randn(H, device=_DEV, dtype=torch.float32)
-    print(f"\n### {tag}  N={N} BS={BS} KV={KV} H={H} D={D} {'MLA' if mla else 'MHA'}  vs gold")
+    print(f"\n### {tag}  N={N} BS={BS} KV={KV} H={H} D={D} {'MLA' if mla else 'MHA'}"
+          f"{f'  HG={hg}' if hg else ''}  vs gold")
     ok = True
     for dt in _DTYPES:
         qg_d = qg.to(dt)
@@ -79,7 +80,7 @@ def run_dense(tag, N, BS, KV, H, D, *, mla=False):
                                               vL.float().unsqueeze(2).expand(N, KV, H, D), sink,
                                               scale=scale, compute_dtype=torch.float32)
             o, _ = swa_sink_attn_fwd_ascend(qg_d.permute(0, 2, 1, 3).contiguous(), kL, vL, sink,
-                                            0, 0, scale=scale, dense=True, BLOCK_M=8, BLOCK_N=16)
+                                            0, 0, scale=scale, dense=True, BLOCK_M=8, BLOCK_N=16, HG=hg)
         else:
             kg = torch.randn(N, KV, H, D, device=_DEV, dtype=dt); vg = torch.randn(N, KV, H, D, device=_DEV, dtype=dt)
             gold = dspark_block_attention_ref(qg_d.float(), kg.float(), vg.float(), sink,
@@ -129,6 +130,10 @@ def main():
     ok &= run_windowed("[asym-mla] windowed MLA", 2, 8, 384, 64, wl, wr, mla=True)
     ok &= run_dense("[gold] dense", 4, BS, KV, 8, 64)
     ok &= run_dense("[gold-mla] dense MLA", 4, BS, KV, 8, 64, mla=True)
+    # head-batched MLA-dense kernel (HG heads -> M=HG*BS); H not divisible by HG on purpose
+    ok &= run_dense("[hg] dense MLA head-batched", 4, BS, KV, 8, 64, mla=True, hg=3)
+    ok &= run_dense("[hg-real] DSV4 head-batched", 2, BS, KV, DSV4["num_heads"], DSV4["head_dim"],
+                    mla=True, hg=8)
     # real DSV4 D=512: small tiles for shared-memory headroom on smaller GPUs
     ok &= run_windowed("[real] DSV4 H=64 D=512", 1, DSV4["num_heads"], 256, DSV4["head_dim"],
                        wl, wr, block_m=16, block_n=16)

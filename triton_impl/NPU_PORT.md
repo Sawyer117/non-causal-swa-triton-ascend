@@ -24,7 +24,29 @@ backend lowering + on-device perf tuning remain for the A3. The CUDA kernels
   validated CUDA backward across windowed/dense, MHA/MLA, real DSV4, and num_programs=1/3.
 - Autograd op (fwd+bwd) + default tile sizes by head_dim (small for D>=256 so D=512 fits on-chip).
 
+## On the A3 (measured 2026-07-13)
+
+- **Correct on real hardware**: `fused_sas_vs_ours.py` — our Triton op matches the vllm_ascend gold
+  (`OURS(triton) allclose=True maxAbs=7.81e-03`, bf16 rounding). Backward matches eager autograd
+  grads (fp32 ~1e-6, bf16 ~1e-2). All Triton constructs (dot/trans/exp2/dynamic-range/num_programs/
+  input_precision) lower on Triton-Ascend. This is the hard milestone — it's done.
+- **Perf lever is data-partitioning, NOT the grid cap.** The NPU is SIMD: a 1-D grid partitions data
+  across cores, each core is invoked once and vectorizes its slice (no serial re-launch penalty). The
+  forward was slow because each tile was **M=7** (one head's BS queries) → the Cube's M axis starved.
+  - Forward BN sweep (flash kernel): default(16,16) 0.10x → **BN=135 (KV in one key-block) 0.44x**;
+    bigger BM *hurt* (BM=32 worse). So one big QK matmul >> nine tiny ones.
+  - **Head-batched MLA-dense forward** (`_swa_sink_fwd_mla_dense_kernel`, opt-in via `HG=`): the KV
+    latent is shared across all H heads, so HG heads batch into M (**M=HG*BS** not 7) and KV fits one
+    key-block → single-pass softmax, per-row sink gather. Sweep `HG=8 python fused_sas_vs_ours.py`.
+- **Backward L1 ("cbuf") limit = 512KB.** `_bwd_dq_ascend_kernel` overflows at BLOCK_N>=128 with
+  D=512 (loads K[BN,D]+V[BN,D], multi-buffer doubles it): `cbuf overflow 4718592 > 4194304 bits`. So
+  fwd and bwd use **independent tiles**; `_bwd_safe_blocks` caps bwd BN (D>=512 → BN<=32) so a
+  forward BN/HG sweep never crashes the backward. Real fix if ever needed = D-tiling the backward.
+
 ## TODO on the A3 (needs the hardware — measure, don't guess)
+
+0. **Sweep `HG`** (head-batched fwd) in {4,8,16,32}; pick the fastest that stays correct. Then, if
+   the backward dominates fwd+bwd, apply the same head-batching to the dq / dkdv-MLA backward.
 
 1. **Confirm lowering** on Triton-Ascend: `tl.dot`, `tl.trans`, `tl.math.exp2`, dynamic
    `range(lo, hi, step)`, `tl.num_programs`. If any won't lower, adjust (the eager fp32 path is

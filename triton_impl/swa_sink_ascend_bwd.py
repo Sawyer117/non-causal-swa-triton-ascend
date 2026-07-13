@@ -22,6 +22,18 @@ from .swa_sink_ascend import _kv_strides, _num_cores, _default_blocks, swa_sink_
 LOG2E = tl.constexpr(1.4426950408889634)
 
 
+def _bwd_safe_blocks(D, bm, bn):
+    """The backward loads BOTH K[BN,D] and V[BN,D] per n-iter, and Ascend's auto multi-buffer
+    ~doubles that on-chip; large BN at big D overflows the 512KB L1 ("cbuf overflow"). The FORWARD
+    wants a big BN for speed (KV in one block) but the backward must stay small, so cap BN/BM here
+    for large head_dim (fwd and bwd use independent tiles). See memory ascend-bwd-cbuf-limit."""
+    if D >= 512:
+        return min(bm, 16), min(bn, 32)
+    if D >= 256:
+        return min(bm, 32), min(bn, 64)
+    return bm, bn
+
+
 @triton.jit
 def _bwd_dq_ascend_kernel(
     Q, K, V, DO, Lse, Delta, DQ,
@@ -259,6 +271,7 @@ def swa_sink_bwd_ascend(q, k, v, sink, o, lse, do, win_left, win_right, dense, s
     Same signature/semantics as swa_sink_bwd; GPU-testable. BLOCK_M/BLOCK_N default by head_dim."""
     B, H, LQ, D = q.shape
     BLOCK_M, BLOCK_N = _default_blocks(D, BLOCK_M, BLOCK_N)
+    BLOCK_M, BLOCK_N = _bwd_safe_blocks(D, BLOCK_M, BLOCK_N)   # keep K+V (x multi-buffer) in L1
     mla = (k.dim() == 3)
     LK = k.shape[1] if mla else k.shape[2]
     windowed = not dense

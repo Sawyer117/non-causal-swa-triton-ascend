@@ -114,6 +114,104 @@ def _swa_sink_fwd_ascend_kernel(
         tl.store(Lse + (b * H + h) * LQ + offs_m, lse, mask=m_valid)
 
 
+@triton.jit
+def _swa_sink_fwd_mla_dense_kernel(
+    Q, K, V, Sink, Out, Lse,
+    stride_qn, stride_qh, stride_qm, stride_qd,      # Q [N, H, BS, D]
+    stride_kn, stride_kk, stride_kd,                 # K [N, KV, D] shared latent (MLA)
+    stride_vn, stride_vk, stride_vd,
+    stride_on, stride_oh, stride_om, stride_od,      # Out [N, H, BS, D]
+    H, KV, scale,
+    NUM_TILES, NUM_HG,                               # tiles = N * cdiv(H, HG)
+    HG: tl.constexpr, BS: tl.constexpr, BLOCK_M: tl.constexpr, BLOCK_N: tl.constexpr,
+    BLOCK_D: tl.constexpr, D: tl.constexpr,
+):
+    """HEAD-BATCHED MLA-dense forward (the production block-attention shape). One program handles
+    one (block n, head-group g): it flattens HG heads x BS queries into the matmul M axis (M=HG*BS
+    instead of 7) so the Cube isn't starved, and — because MLA shares one KV latent across all H
+    heads — every row attends the SAME K/V[KV,D]. KV fits one key-block (BLOCK_N>=KV) so it's a
+    SINGLE-PASS softmax (no online rescale). Per-row sink: row r -> head h0 + r//BS (fp32 logit in
+    the denominator, absent from P@V). Same math/lse as the flash kernel; separate kernel keeps the
+    validated path untouched. 1-D core-capped grid-stride, no `%`."""
+    pid = tl.program_id(0)
+    num_prog = tl.num_programs(0)
+    offs_d = tl.arange(0, BLOCK_D)
+    d_mask = offs_d < D
+    offs_m = tl.arange(0, BLOCK_M)
+    offs_n = tl.arange(0, BLOCK_N)
+    n_valid = offs_n < KV
+    qk_scale = scale * LOG2E
+
+    for tile in range(pid, NUM_TILES, num_prog):
+        n = tile // NUM_HG
+        g = tile - n * NUM_HG
+        h0 = g * HG
+        rows_valid = (tl.minimum(h0 + HG, H) - h0) * BS      # BS*heads present in this group
+        row_ok = offs_m < rows_valid
+
+        # Q for heads [h0:h0+HG] x BS rows is contiguous -> flat [HG*BS, D], row stride = stride_qm.
+        base_q = Q + n * stride_qn + h0 * stride_qh
+        q_block = tl.load(base_q + offs_m[:, None] * stride_qm + offs_d[None, :] * stride_qd,
+                          mask=(row_ok[:, None] & d_mask[None, :]), other=0.0)
+        # per-row sink logit: head(row) = h0 + row // BS  (no `%`; masked gather)
+        sink_val = tl.load(Sink + (h0 + offs_m // BS), mask=row_ok, other=0.0).to(tl.float32)
+        s = sink_val * LOG2E
+
+        k_block = tl.load(K + n * stride_kn + offs_n[:, None] * stride_kk + offs_d[None, :] * stride_kd,
+                          mask=(n_valid[:, None] & d_mask[None, :]), other=0.0)
+        qk = tl.dot(q_block, tl.trans(k_block), input_precision="ieee").to(tl.float32) * qk_scale
+        qk = tl.where(n_valid[None, :], qk, float("-inf"))
+
+        m = tl.maximum(tl.max(qk, axis=1), s)                # rowmax including the sink virtual key
+        p = tl.math.exp2(qk - m[:, None])
+        l = tl.sum(p, axis=1) + tl.math.exp2(s - m)          # denom keeps the sink term
+
+        v_block = tl.load(V + n * stride_vn + offs_n[:, None] * stride_vk + offs_d[None, :] * stride_vd,
+                          mask=(n_valid[:, None] & d_mask[None, :]), other=0.0)
+        o = tl.dot(p.to(v_block.dtype), v_block, input_precision="ieee") / l[:, None]
+
+        base_o = Out + n * stride_on + h0 * stride_oh
+        tl.store(base_o + offs_m[:, None] * stride_om + offs_d[None, :] * stride_od,
+                 o.to(Out.dtype.element_ty), mask=(row_ok[:, None] & d_mask[None, :]))
+        tl.store(Lse + (n * H + h0) * BS + offs_m, m + tl.log2(l), mask=row_ok)
+
+
+def swa_sink_attn_fwd_mla_dense_ascend(q, k, v, sink, scale=None, HG=8, BLOCK_N=None,
+                                       num_programs=None):
+    """Head-batched MLA-dense forward. q [N,H,BS,D]; k,v latent [N,KV,D]; sink [H]. Returns (o, lse)
+    in the SAME layout/format as swa_sink_attn_fwd_ascend (o [N,H,BS,D], lse [N,H,BS]) so the
+    existing backward consumes it unchanged. Single-pass: needs the whole KV in one key-block
+    (BLOCK_N>=KV; default next_pow2(KV)). HG = heads batched into M per program (M=HG*BS)."""
+    assert q.dim() == 4 and k.dim() == 3, "head-batched path is MLA dense: q[N,H,BS,D], kv[N,KV,D]"
+    # heads are flattened into M via a single row stride (stride_qm), so the [H,BS,D] block must be
+    # C-contiguous (stride_qh == BS*stride_qm). The harness passes .contiguous(); enforce it here.
+    q = q.contiguous()
+    N, H, BS, D = q.shape
+    KV = k.shape[1]
+    scale = D ** -0.5 if scale is None else scale
+    sink = sink.to(torch.float32).contiguous()
+    o = torch.empty_like(q)
+    lse = torch.empty(N, H, BS, device=q.device, dtype=torch.float32)
+    BLOCK_D = triton.next_power_of_2(D)
+    BLOCK_N = triton.next_power_of_2(KV) if BLOCK_N is None else BLOCK_N
+    assert BLOCK_N >= KV, "head-batched path needs the whole KV in one key-block (BLOCK_N>=KV)"
+    HG = min(HG, H)
+    BLOCK_M = triton.next_power_of_2(HG * BS)
+    num_hg = triton.cdiv(H, HG)
+    num_tiles = N * num_hg
+    gsize = num_programs if num_programs else min(num_tiles, _num_cores(q.device))
+    _swa_sink_fwd_mla_dense_kernel[(gsize,)](
+        q, k, v, sink, o, lse,
+        q.stride(0), q.stride(1), q.stride(2), q.stride(3),
+        k.stride(0), k.stride(1), k.stride(2),
+        v.stride(0), v.stride(1), v.stride(2),
+        o.stride(0), o.stride(1), o.stride(2), o.stride(3),
+        H, KV, scale, num_tiles, num_hg,
+        HG=HG, BS=BS, BLOCK_M=BLOCK_M, BLOCK_N=BLOCK_N, BLOCK_D=BLOCK_D, D=D,
+    )
+    return o, lse
+
+
 def _kv_strides(t):
     if t.dim() == 4:
         return t.stride(0), t.stride(1), t.stride(2), t.stride(3)
@@ -146,11 +244,19 @@ def _num_cores(device):
 
 
 def swa_sink_attn_fwd_ascend(q, k, v, sink, win_left, win_right, scale=None,
-                             dense=False, BLOCK_M=None, BLOCK_N=None, fp32_qk=True, num_programs=None):
+                             dense=False, BLOCK_M=None, BLOCK_N=None, fp32_qk=True, num_programs=None,
+                             HG=None):
     """Ascend-shaped forward (1-D, core-capped grid-stride). Returns (o, lse). q [B,H,LQ,D];
     k,v [B,H,LK,D] (MHA) or [B,LK,D] (MLA). dense=True -> no window (Lq!=Lk allowed). Runs on CUDA
     for validation. BLOCK_M/BLOCK_N default by head_dim (small for D>=256). num_programs overrides
-    the grid size (default = min(NUM_TILES, core count))."""
+    the grid size (default = min(NUM_TILES, core count)).
+
+    HG (heads-per-tile, opt-in): for the MLA-dense production shape, dispatch to the head-batched
+    kernel that flattens HG heads into the matmul M axis (M=HG*BS) — much better Cube utilisation
+    on the NPU. Only valid for dense + MLA (k.dim()==3); ignored otherwise. Same (o, lse) format."""
+    if HG and dense and k.dim() == 3:
+        return swa_sink_attn_fwd_mla_dense_ascend(q, k, v, sink, scale=scale, HG=HG,
+                                                  BLOCK_N=BLOCK_N, num_programs=num_programs)
     assert q.dim() == 4, "q must be [B,H,LQ,D]"
     B, H, LQ, D = q.shape
     LK = k.shape[1] if k.dim() == 3 else k.shape[2]

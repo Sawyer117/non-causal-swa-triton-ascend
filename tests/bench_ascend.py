@@ -37,6 +37,7 @@ DT = {"bfloat16": torch.bfloat16, "float16": torch.float16, "float32": torch.flo
 LS = [int(x) for x in os.environ.get("LS", "256,512,1024").split(",")]
 BM_ENV = int(os.environ["BM"]) if "BM" in os.environ else None   # override tile sizes to experiment
 BN_ENV = int(os.environ["BN"]) if "BN" in os.environ else None
+HG_ENV = int(os.environ["HG"]) if "HG" in os.environ else None   # head-batched MLA-dense fwd (M=HG*BS)
 ITERS, WARMUP = 20, 5
 
 
@@ -151,21 +152,21 @@ def bench_dense_mla(N, BS, KV, H, D):
         def s():
             with torch.no_grad():
                 swa_sink_attn_fwd_ascend(qk, kL, vL, sink, 0, 0, scale=scale, dense=True,
-                                         num_programs=npg, BLOCK_M=bm, BLOCK_N=bn)
+                                         num_programs=npg, BLOCK_M=bm, BLOCK_N=bn, HG=HG_ENV)
         return s
 
     def asc_fb(npg):
         def s():
             o, lse = swa_sink_attn_fwd_ascend(qk, kL, vL, sink, 0, 0, scale=scale, dense=True,
-                                              num_programs=npg, BLOCK_M=bm, BLOCK_N=bn)
-            swa_sink_bwd_ascend(qk, kL, vL, sink, o, lse, do, 0, 0, True, scale,
-                                BLOCK_M=bm, BLOCK_N=bn, num_programs=npg)
+                                              num_programs=npg, BLOCK_M=bm, BLOCK_N=bn, HG=HG_ENV)
+            swa_sink_bwd_ascend(qk, kL, vL, sink, o, lse, do, 0, 0, True, scale, num_programs=npg)
         return s
 
-    print(f"\n### dense MLA (production)  N={N} BS={BS} KV={KV} H={H} D={D}  dtype={DT}  tile=({bm},{bn})")
+    print(f"\n### dense MLA (production)  N={N} BS={BS} KV={KV} H={H} D={D}  dtype={DT}  tile=({bm},{bn})"
+          f"{f'  HG={HG_ENV}' if HG_ENV else ''}")
     with torch.no_grad():
         o_a, _ = swa_sink_attn_fwd_ascend(qk, kL, vL, sink, 0, 0, scale=scale, dense=True,
-                                          BLOCK_M=bm, BLOCK_N=bn)
+                                          BLOCK_M=bm, BLOCK_N=bn, HG=HG_ENV)
     ref = dspark_block_attention_ref(qk.transpose(1, 2).float(),
                                      kL.float().unsqueeze(2).expand(N, KV, H, D),
                                      vL.float().unsqueeze(2).expand(N, KV, H, D), sink,
