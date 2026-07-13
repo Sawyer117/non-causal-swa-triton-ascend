@@ -79,8 +79,9 @@ def run_dense(tag, N, BS, KV, H, D, *, mla=False, hg=None):
             gold = dspark_block_attention_ref(qg_d.float(), kL.float().unsqueeze(2).expand(N, KV, H, D),
                                               vL.float().unsqueeze(2).expand(N, KV, H, D), sink,
                                               scale=scale, compute_dtype=torch.float32)
+            # MLA-dense -> D-tiled kernel; let HG/default drive BLOCK_M (don't force it)
             o, _ = swa_sink_attn_fwd_ascend(qg_d.permute(0, 2, 1, 3).contiguous(), kL, vL, sink,
-                                            0, 0, scale=scale, dense=True, BLOCK_M=8, BLOCK_N=16, HG=hg)
+                                            0, 0, scale=scale, dense=True, HG=hg)
         else:
             kg = torch.randn(N, KV, H, D, device=_DEV, dtype=dt); vg = torch.randn(N, KV, H, D, device=_DEV, dtype=dt)
             gold = dspark_block_attention_ref(qg_d.float(), kg.float(), vg.float(), sink,

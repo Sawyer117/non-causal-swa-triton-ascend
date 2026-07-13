@@ -20,14 +20,14 @@ RUN on the A3 (env dspark-dsv4-base, vllm_ascend installed):
     DTYPE=float32 python fused_sas_vs_ours.py        # diffs collapse to ~1e-6
     NBLK=512 python fused_sas_vs_ours.py             # full scale
 
-PERF TUNING (the forward was Cube-starved at M=7 = one head's BS queries):
-    HG=2 python fused_sas_vs_ours.py                 # head-batched fwd: 2 heads -> M=2*7=14
-    HG=4 python fused_sas_vs_ours.py                 # M=28 (pad 32); sweep HG in {2,3,4}
-  HG dispatches the MLA-dense head-batched kernel: all H heads share the KV latent, so HG heads
-  batch into the matmul M axis (M=HG*BS instead of 7). Flash-style (staged K/V, small BLOCK_N); the
-  acc[M,D] fp32 lives in the 192KB UB so M (=HG*BS padded) caps ~32 at D=512 -> keep HG<=4 (HG>=8
-  overflows UB). BN=<n> tunes the staged key-block (default 64). Backward auto-uses L1-safe tiles.
-  Without HG, BN=135 tunes the plain flash forward (whole KV in one key-block).
+PERF TUNING (MLA-dense uses the D-tiled kernel by default; the forward was Cube-starved at M=7):
+    python fused_sas_vs_ours.py                      # default BLOCK_M=64 rows/tile, BLOCK_K=128
+    BM=128 python fused_sas_vs_ours.py               # more rows per tile (fills the Cube M axis)
+    BM=64 BK=256 python fused_sas_vs_ours.py         # sweep the D-tile too
+  The MLA KV latent is shared across all H heads, so a program batches BLOCK_M flattened (head,query)
+  rows against the same K/V. KV=135 is tiny -> single-pass softmax (full scores[M,135]). D=512 is
+  TILED by BLOCK_K in both matmuls, so nothing [*,512] is on chip (no more UB/cbuf overflow) and M
+  can grow. Sweep BM in {32,64,128,256}, BK in {64,128,256}. HG=n is an alias (BLOCK_M=next_pow2(n*BS)).
 """
 import os
 import time
@@ -64,9 +64,10 @@ D = int(os.environ.get("D", "512"))
 KV = WIN + BS
 SCALE = D ** -0.5
 NITER = 20
-BM = int(os.environ["BM"]) if "BM" in os.environ else None   # tile override (perf tuning on the A3)
-BN = int(os.environ["BN"]) if "BN" in os.environ else None   # e.g. BN=128 -> KV in one key-block
-HG = int(os.environ["HG"]) if "HG" in os.environ else None   # head-batched fwd: HG heads -> M=HG*BS
+BM = int(os.environ["BM"]) if "BM" in os.environ else None   # fwd rows per tile (M axis, Cube fill)
+BN = int(os.environ["BN"]) if "BN" in os.environ else None   # (legacy flash key-block; unused by D-tiled fwd)
+HG = int(os.environ["HG"]) if "HG" in os.environ else None   # alias: BLOCK_M = next_pow2(HG*BS)
+BK = int(os.environ["BK"]) if "BK" in os.environ else None   # fwd D-tile (BLOCK_K, default 128)
 
 mm, wl, wr = _dspark_sas_window(BS, WIN)
 print(f">>> OUR Ascend op vs vllm_ascend GOLD  (_dspark_attention_reference)")
@@ -102,15 +103,15 @@ def manual():
 
 
 def ours_fwd():
-    o, _ = swa_sink_attn_fwd_ascend(Q.transpose(1, 2).contiguous(), KL, VL, SINK, 0, 0,
-                                    scale=SCALE, dense=True, BLOCK_M=BM, BLOCK_N=BN, HG=HG)  # [N,H,BS,D]
+    o, _ = swa_sink_attn_fwd_ascend(Q.transpose(1, 2).contiguous(), KL, VL, SINK, 0, 0, scale=SCALE,
+                                    dense=True, BLOCK_M=BM, HG=HG, BLOCK_K=BK)  # [N,H,BS,D]
     return o.transpose(1, 2)                                              # [N,BS,H,D]
 
 
 def ours_fb():
     qk = Q.transpose(1, 2).contiguous()
     o, lse = swa_sink_attn_fwd_ascend(qk, KL, VL, SINK, 0, 0, scale=SCALE, dense=True,
-                                      BLOCK_M=BM, BLOCK_N=BN, HG=HG)
+                                      BLOCK_M=BM, HG=HG, BLOCK_K=BK)
     # HG head-batches the backward too; else it keeps its own L1-safe tiles (don't force BM/BN here).
     swa_sink_bwd_ascend(qk, KL, VL, SINK, o, lse, DO.transpose(1, 2).contiguous(),
                         0, 0, True, SCALE, HG=HG)
@@ -145,6 +146,20 @@ g = gold()
 for name, out in (("manual(einsum)", manual()), ("OURS(triton)", ours_fwd())):
     c, mx, ma, mr = cmp(out, g)
     print(f"[parity vs gold]  {name:16} allclose={c}  maxAbs={mx:.2e}  meanAbs={ma:.2e}  meanRel={mr:.2e}")
+
+# ---- fp32 sanity: same kernel in fp32 vs the fp32 gold. Ascend has no tf32, so bf16 inputs -> a
+# bf16 Cube (the ~1e-2 above is inherent dtype rounding). In fp32 the Cube is exact -> ~1e-6, which
+# proves the kernel MATH matches gold (not a bug). Skipped when already running DTYPE=float32.
+if DT is not torch.float32:
+    Qf, KLf, VLf, SKf = Q.float(), KL.float(), VL.float(), SINK.float()
+    khf = KLf.unsqueeze(2).expand(NBLK, KV, H, D); vhf = VLf.unsqueeze(2).expand(NBLK, KV, H, D)
+    gf = torch.stack([_dspark_attention_reference(Qf[i], khf[i], vhf[i], SKf, SCALE)
+                      for i in range(NBLK)], dim=0)
+    of32, _ = swa_sink_attn_fwd_ascend(Qf.transpose(1, 2).contiguous(), KLf, VLf, SKf, 0, 0,
+                                       scale=SCALE, dense=True, BLOCK_M=BM, HG=HG, BLOCK_K=BK)
+    c, mx, ma, mr = cmp(of32.transpose(1, 2), gf)
+    print(f"[parity fp32   ]  OURS(triton)     allclose={c}  maxAbs={mx:.2e}  meanAbs={ma:.2e}  "
+          f"meanRel={mr:.2e}   (math check; bf16 diff above is dtype rounding, not a bug)")
 
 # ---- speed + memory: OURS vs the eager fallback (manual einsum) ----
 print()

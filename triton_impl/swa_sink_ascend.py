@@ -117,98 +117,94 @@ def _swa_sink_fwd_ascend_kernel(
 @triton.jit
 def _swa_sink_fwd_mla_dense_kernel(
     Q, K, V, Sink, Out, Lse,
-    stride_qn, stride_qh, stride_qm, stride_qd,      # Q [N, H, BS, D]
+    stride_qn, stride_qh, stride_qm, stride_qd,      # Q [N, H, BS, D]; flat row stride = stride_qm
     stride_kn, stride_kk, stride_kd,                 # K [N, KV, D] shared latent (MLA)
     stride_vn, stride_vk, stride_vd,
     stride_on, stride_oh, stride_om, stride_od,      # Out [N, H, BS, D]
-    H, KV, scale,
-    NUM_TILES, NUM_HG,                               # tiles = N * cdiv(H, HG)
-    HG: tl.constexpr, BS: tl.constexpr, BLOCK_M: tl.constexpr, BLOCK_N: tl.constexpr,
-    BLOCK_D: tl.constexpr, D: tl.constexpr,
+    H, HR, KV, scale,                                # HR = H*BS = rows per block
+    NUM_TILES, NUM_M_TILES,                          # tiles = N * cdiv(HR, BLOCK_M)
+    BS: tl.constexpr, BLOCK_M: tl.constexpr, BLOCK_N: tl.constexpr, BLOCK_K: tl.constexpr,
+    D: tl.constexpr,
 ):
-    """HEAD-BATCHED MLA-dense forward (the production block-attention shape). One program handles
-    one (block n, head-group g): it flattens HG heads x BS queries into the matmul M axis (M=HG*BS
-    instead of 7) so the Cube isn't starved on the M axis — because MLA shares one KV latent across
-    all H heads, every row attends the SAME K/V[KV,D]. Per-row sink: row r -> head h0 + r//BS (fp32
-    logit in the denominator, absent from P@V). Uses the SAME flash online-softmax + staged K/V
-    n-loop as the validated kernel (small BLOCK_N so K/V don't blow the 512KB L1, and acc[M,D] fits
-    the 192KB UB — which caps M ~= 32 at D=512, i.e. HG~=4). Same math/lse. 1-D grid-stride, no `%`."""
+    """D-TILED MLA-dense forward (the production block-attention shape). One program owns a block n
+    and a row-tile of BLOCK_M rows = flattened (head, query) pairs — because MLA shares one KV latent
+    across all H heads, every row attends the SAME K/V[KV,D]. KV=135 is tiny so it's a SINGLE-PASS
+    softmax (full scores[M,KV], no online rescale). The D=512 head dim is TILED by BLOCK_K in BOTH
+    matmuls so nothing of shape [*,512] is ever on chip (fits the 192KB UB / 512KB L1 per the
+    Triton-Ascend matmul guide: for k in range(0,D,BLOCK_K)), which lets M grow to fill the Cube.
+    Per-row sink: head(row)=row//BS, an fp32 logit in the denominator, absent from P@V. 1-D
+    grid-stride, no `%`; masked loads make the boundary `tl.where`/mask redundant so they're omitted."""
     pid = tl.program_id(0)
     num_prog = tl.num_programs(0)
-    offs_d = tl.arange(0, BLOCK_D)
-    d_mask = offs_d < D
     offs_m = tl.arange(0, BLOCK_M)
+    offs_n = tl.arange(0, BLOCK_N)                   # BLOCK_N == KV (all keys valid; no key mask)
     qk_scale = scale * LOG2E
 
     for tile in range(pid, NUM_TILES, num_prog):
-        n = tile // NUM_HG
-        g = tile - n * NUM_HG
-        h0 = g * HG
-        rows_valid = (tl.minimum(h0 + HG, H) - h0) * BS      # BS*heads present in this group
-        row_ok = offs_m < rows_valid
+        n = tile // NUM_M_TILES
+        mt = tile - n * NUM_M_TILES
+        m0 = mt * BLOCK_M
+        rows = m0 + offs_m                           # global (head,query) row within block n
+        row_ok = rows < HR
 
-        # Q for heads [h0:h0+HG] x BS rows is contiguous -> flat [HG*BS, D], row stride = stride_qm.
-        base_q = Q + n * stride_qn + h0 * stride_qh
-        q_block = tl.load(base_q + offs_m[:, None] * stride_qm + offs_d[None, :] * stride_qd,
-                          mask=(row_ok[:, None] & d_mask[None, :]), other=0.0)
-        # per-row sink logit: head(row) = h0 + row // BS  (no `%`; masked gather)
-        sink_val = tl.load(Sink + (h0 + offs_m // BS), mask=row_ok, other=0.0).to(tl.float32)
+        # ---- QK^T with D-tiling -> scores[M, KV] ----
+        scores = tl.zeros([BLOCK_M, BLOCK_N], dtype=tl.float32)
+        base_q = Q + n * stride_qn + m0 * stride_qm  # flat row stride spans heads (C-contiguous)
+        base_k = K + n * stride_kn
+        for d0 in range(0, D, BLOCK_K):
+            offs_k = d0 + tl.arange(0, BLOCK_K)
+            q = tl.load(base_q + offs_m[:, None] * stride_qm + offs_k[None, :] * stride_qd,
+                        mask=(row_ok[:, None] & (offs_k[None, :] < D)), other=0.0)
+            kk = tl.load(base_k + offs_n[:, None] * stride_kk + offs_k[None, :] * stride_kd,
+                         mask=(offs_k[None, :] < D), other=0.0)
+            scores += tl.dot(q, tl.trans(kk), input_precision="ieee").to(tl.float32)
+        scores = scores * qk_scale
 
-        m_i = sink_val * LOG2E                                # seed sink as a per-row virtual key
-        l_i = tl.full([BLOCK_M], 1.0, dtype=tl.float32)
-        acc = tl.zeros([BLOCK_M, BLOCK_D], dtype=tl.float32)
+        # ---- softmax with per-row sink (single pass; KV all valid) ----
+        sink_val = tl.load(Sink + (rows // BS), mask=row_ok, other=0.0).to(tl.float32)
+        s = sink_val * LOG2E
+        m = tl.maximum(tl.max(scores, axis=1), s)
+        p = tl.math.exp2(scores - m[:, None])
+        l = tl.sum(p, axis=1) + tl.math.exp2(s - m)  # denom keeps the sink term
+        p = p.to(V.dtype.element_ty)
 
-        for n_start in range(0, KV, BLOCK_N):                # staged K/V (keeps L1/UB bounded)
-            offs_n = n_start + tl.arange(0, BLOCK_N)
-            n_valid = offs_n < KV
-            k_block = tl.load(K + n * stride_kn + offs_n[:, None] * stride_kk + offs_d[None, :] * stride_kd,
-                              mask=(n_valid[:, None] & d_mask[None, :]), other=0.0)
-            qk = tl.dot(q_block, tl.trans(k_block), input_precision="ieee").to(tl.float32) * qk_scale
-            qk = tl.where(n_valid[None, :], qk, float("-inf"))
-            m_ij = tl.maximum(m_i, tl.max(qk, axis=1))
-            p = tl.math.exp2(qk - m_ij[:, None])
-            alpha = tl.math.exp2(m_i - m_ij)
-            l_i = l_i * alpha + tl.sum(p, axis=1)
-            v_block = tl.load(V + n * stride_vn + offs_n[:, None] * stride_vk + offs_d[None, :] * stride_vd,
-                              mask=(n_valid[:, None] & d_mask[None, :]), other=0.0)
-            acc = acc * alpha[:, None] + tl.dot(p.to(v_block.dtype), v_block, input_precision="ieee")
-            m_i = m_ij
-
-        o = acc / l_i[:, None]
-        base_o = Out + n * stride_on + h0 * stride_oh
-        tl.store(base_o + offs_m[:, None] * stride_om + offs_d[None, :] * stride_od,
-                 o.to(Out.dtype.element_ty), mask=(row_ok[:, None] & d_mask[None, :]))
-        tl.store(Lse + (n * H + h0) * BS + offs_m, m_i + tl.log2(l_i), mask=row_ok)
+        # ---- P@V with D-tiling -> o[M, D] chunk by chunk ----
+        base_v = V + n * stride_vn
+        base_o = Out + n * stride_on + m0 * stride_om
+        for d0 in range(0, D, BLOCK_K):
+            offs_k = d0 + tl.arange(0, BLOCK_K)
+            vv = tl.load(base_v + offs_n[:, None] * stride_vk + offs_k[None, :] * stride_vd,
+                         mask=(offs_k[None, :] < D), other=0.0)
+            o = tl.dot(p, vv, input_precision="ieee").to(tl.float32) / l[:, None]
+            tl.store(base_o + offs_m[:, None] * stride_om + offs_k[None, :] * stride_od,
+                     o.to(Out.dtype.element_ty), mask=(row_ok[:, None] & (offs_k[None, :] < D)))
+        tl.store(Lse + n * HR + rows, m + tl.log2(l), mask=row_ok)
 
 
-def swa_sink_attn_fwd_mla_dense_ascend(q, k, v, sink, scale=None, HG=4, BLOCK_N=None,
-                                       num_programs=None):
-    """Head-batched MLA-dense forward. q [N,H,BS,D]; k,v latent [N,KV,D]; sink [H]. Returns (o, lse)
-    in the SAME layout/format as swa_sink_attn_fwd_ascend (o [N,H,BS,D], lse [N,H,BS]) so the
-    existing backward consumes it unchanged. HG = heads batched into the matmul M axis (M=HG*BS).
-    Flash online softmax with staged K/V (BLOCK_N default 64) so it stays in L1/UB. Note: acc[M,D]
-    is fp32 in the 192KB UB, so M (=HG*BS, padded) is capped ~32 at D=512 -> keep HG<=4 there."""
-    assert q.dim() == 4 and k.dim() == 3, "head-batched path is MLA dense: q[N,H,BS,D], kv[N,KV,D]"
-    # heads are flattened into M via a single row stride (stride_qm), so the [H,BS,D] block must be
-    # C-contiguous (stride_qh == BS*stride_qm). The harness passes .contiguous(); enforce it here.
+def swa_sink_attn_fwd_mla_dense_ascend(q, k, v, sink, scale=None, HG=None, BLOCK_M=None,
+                                       BLOCK_K=None, num_programs=None):
+    """D-tiled MLA-dense forward. q [N,H,BS,D]; k,v latent [N,KV,D]; sink [H]. Returns (o, lse) in the
+    SAME layout/format as swa_sink_attn_fwd_ascend (o [N,H,BS,D], lse [N,H,BS]) so the backward
+    consumes it unchanged. BLOCK_M = flattened (head,query) rows per program (M axis; the Cube-fill
+    lever); BLOCK_K tiles the D=512 head dim so nothing of shape [*,512] is on chip. HG is a
+    convenience alias: BLOCK_M = next_pow2(HG*BS)."""
+    assert q.dim() == 4 and k.dim() == 3, "MLA-dense path: q[N,H,BS,D], kv[N,KV,D]"
+    # rows are flattened into M via a single row stride (stride_qm), so [H,BS,D] must be C-contiguous.
     q = q.contiguous()
     N, H, BS, D = q.shape
     KV = k.shape[1]
+    HR = H * BS
     scale = D ** -0.5 if scale is None else scale
     sink = sink.to(torch.float32).contiguous()
     o = torch.empty_like(q)
     lse = torch.empty(N, H, BS, device=q.device, dtype=torch.float32)
-    BLOCK_D = triton.next_power_of_2(D)
-    HG = min(HG, H)
-    BLOCK_M = triton.next_power_of_2(HG * BS)
-    if BLOCK_N is None:                                 # staged key-block; shrink it as M grows so
-        BLOCK_N = 64                                    # acc[M,D]fp32 + K/V[BN,D] stay in the 192KB UB
-        if D >= 512 and BLOCK_M > 16:
-            BLOCK_N = 16
-        elif D >= 256 and BLOCK_M > 32:
-            BLOCK_N = 32
-    num_hg = triton.cdiv(H, HG)
-    num_tiles = N * num_hg
+    if BLOCK_M is None:
+        BLOCK_M = triton.next_power_of_2(HG * BS) if HG else 64
+    BLOCK_M = min(BLOCK_M, triton.next_power_of_2(HR))
+    BLOCK_K = 128 if BLOCK_K is None else BLOCK_K    # D-tile (512B-aligned; keeps [*,BK] on chip)
+    BLOCK_N = KV                                     # KV=135 in one shot (tiny), single-pass softmax
+    num_m_tiles = triton.cdiv(HR, BLOCK_M)
+    num_tiles = N * num_m_tiles
     gsize = num_programs if num_programs else min(num_tiles, _num_cores(q.device))
     _swa_sink_fwd_mla_dense_kernel[(gsize,)](
         q, k, v, sink, o, lse,
@@ -216,8 +212,8 @@ def swa_sink_attn_fwd_mla_dense_ascend(q, k, v, sink, scale=None, HG=4, BLOCK_N=
         k.stride(0), k.stride(1), k.stride(2),
         v.stride(0), v.stride(1), v.stride(2),
         o.stride(0), o.stride(1), o.stride(2), o.stride(3),
-        H, KV, scale, num_tiles, num_hg,
-        HG=HG, BS=BS, BLOCK_M=BLOCK_M, BLOCK_N=BLOCK_N, BLOCK_D=BLOCK_D, D=D,
+        H, HR, KV, scale, num_tiles, num_m_tiles,
+        BS=BS, BLOCK_M=BLOCK_M, BLOCK_N=BLOCK_N, BLOCK_K=BLOCK_K, D=D,
     )
     return o, lse
 
@@ -255,18 +251,18 @@ def _num_cores(device):
 
 def swa_sink_attn_fwd_ascend(q, k, v, sink, win_left, win_right, scale=None,
                              dense=False, BLOCK_M=None, BLOCK_N=None, fp32_qk=True, num_programs=None,
-                             HG=None):
+                             HG=None, BLOCK_K=None):
     """Ascend-shaped forward (1-D, core-capped grid-stride). Returns (o, lse). q [B,H,LQ,D];
     k,v [B,H,LK,D] (MHA) or [B,LK,D] (MLA). dense=True -> no window (Lq!=Lk allowed). Runs on CUDA
     for validation. BLOCK_M/BLOCK_N default by head_dim (small for D>=256). num_programs overrides
     the grid size (default = min(NUM_TILES, core count)).
 
-    HG (heads-per-tile, opt-in): for the MLA-dense production shape, dispatch to the head-batched
-    kernel that flattens HG heads into the matmul M axis (M=HG*BS) — much better Cube utilisation
-    on the NPU. Only valid for dense + MLA (k.dim()==3); ignored otherwise. Same (o, lse) format."""
-    if HG and dense and k.dim() == 3:
-        return swa_sink_attn_fwd_mla_dense_ascend(q, k, v, sink, scale=scale, HG=HG,
-                                                  BLOCK_N=BLOCK_N, num_programs=num_programs)
+    The MLA-dense production shape (dense + k.dim()==3) uses the D-tiled kernel: rows = flattened
+    (head,query) pairs on the matmul M axis (BLOCK_M lever, HG=next_pow2(HG*BS) alias), D=512 tiled
+    by BLOCK_K so nothing [*,512] is on chip. Windowed / MHA keep the plain flash kernel."""
+    if dense and k.dim() == 3:
+        return swa_sink_attn_fwd_mla_dense_ascend(q, k, v, sink, scale=scale, HG=HG, BLOCK_M=BLOCK_M,
+                                                  BLOCK_K=BLOCK_K, num_programs=num_programs)
     assert q.dim() == 4, "q must be [B,H,LQ,D]"
     B, H, LQ, D = q.shape
     LK = k.shape[1] if k.dim() == 3 else k.shape[2]
