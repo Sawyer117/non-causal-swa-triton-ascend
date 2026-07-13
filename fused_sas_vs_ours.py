@@ -72,6 +72,7 @@ BM = int(os.environ["BM"]) if "BM" in os.environ else None   # fwd rows per tile
 BN = int(os.environ["BN"]) if "BN" in os.environ else None   # (legacy flash key-block; unused by D-tiled fwd)
 HG = int(os.environ["HG"]) if "HG" in os.environ else None   # alias: BLOCK_M = next_pow2(HG*BS)
 BK = int(os.environ["BK"]) if "BK" in os.environ else None   # fwd D-tile (BLOCK_K, default 128)
+PVP = "fp32" if os.environ.get("PVF32") else "fp16"          # P@V precision: fp16 default; PVF32=1 -> exact fp32
 # backward tile knobs (sweep on the A3): dq rows / dq D-tile / dk,dv rows / dk,dv key-tile
 BMDQ = int(os.environ["BMDQ"]) if "BMDQ" in os.environ else None
 BKDQ = int(os.environ["BKDQ"]) if "BKDQ" in os.environ else None
@@ -113,14 +114,14 @@ def manual():
 
 def ours_fwd():
     o, _ = swa_sink_attn_fwd_ascend(Q.transpose(1, 2).contiguous(), KL, VL, SINK, 0, 0, scale=SCALE,
-                                    dense=True, BLOCK_M=BM, HG=HG, BLOCK_K=BK)  # [N,H,BS,D]
+                                    dense=True, BLOCK_M=BM, HG=HG, BLOCK_K=BK, pv_prec=PVP)  # [N,H,BS,D]
     return o.transpose(1, 2)                                              # [N,BS,H,D]
 
 
 def ours_fb():
     qk = Q.transpose(1, 2).contiguous()
     o, lse = swa_sink_attn_fwd_ascend(qk, KL, VL, SINK, 0, 0, scale=SCALE, dense=True,
-                                      BLOCK_M=BM, HG=HG, BLOCK_K=BK)
+                                      BLOCK_M=BM, HG=HG, BLOCK_K=BK, pv_prec=PVP)
     # backward is the D-tiled/row-tiled MLA-dense path; BMDQ/BKDQ/BMKV/BKV env sweep its tiles.
     swa_sink_bwd_ascend(qk, KL, VL, SINK, o, lse, DO.transpose(1, 2).contiguous(),
                         0, 0, True, SCALE, BM_DQ=BMDQ, BK_DQ=BKDQ, BM_DKDV=BMKV, BLOCK_KV=BKV)
@@ -226,19 +227,34 @@ if DT is not torch.float32:
     _self_check()
     torch.npu.empty_cache()   # free the fp32 check tensors so they don't pollute the mem benchmark
 
-# ---- speed + memory: OURS vs the eager fallback (manual einsum) ----
+def eager_fb():
+    """differentiable eager fwd+bwd (einsum+sink, K/V separate), the fwd+bwd speed/mem baseline."""
+    q = Q.float().detach().requires_grad_(True); kl = KL.float().detach().requires_grad_(True)
+    vl = VL.float().detach().requires_grad_(True); sk = SINK.float().detach().requires_grad_(True)
+    s = torch.einsum("nqhd,nkd->nqhk", q, kl) * SCALE; skv = sk.view(1, 1, H, 1)
+    smax = torch.maximum(s.max(-1, keepdim=True).values, skv); e = torch.exp(s - smax)
+    p = e / (e.sum(-1, keepdim=True) + torch.exp(skv - smax))
+    (torch.einsum("nqhk,nkd->nqhd", p, vl) * DO.float()).sum().backward()
+
+
+# ---- speed + memory: OURS vs the eager fallback (einsum+sink), forward AND fwd+bwd ----
 print()
 mf = time_ms(lambda: manual())
 of = time_ms(ours_fwd)
 print(f"[fwd  speed]  eager={mf:7.3f}ms   ours={of:7.3f}ms   speedup {mf / of:4.2f}x")
+efb = time_ms(eager_fb)
+ofb = time_ms(ours_fb)
+print(f"[fwd+bwd spd]  eager={efb:7.3f}ms   ours={ofb:7.3f}ms   speedup {efb / ofb:4.2f}x  (grads q,k,v,sink)")
 try:
     om = peak_mb(ours_fwd); em = peak_mb(lambda: manual())
     print(f"[fwd  mem  ]  eager={em:8.1f}MB  ours={om:8.1f}MB   {em / om:4.2f}x less")
+    ofbm = peak_mb(ours_fb); efbm = peak_mb(eager_fb)
+    print(f"[fwd+bwd mem]  eager={efbm:8.1f}MB  ours={ofbm:8.1f}MB   {efbm / ofbm:4.2f}x less")
+    sc = NBLK * BS * H * KV * 4 / 1e6
+    print(f"[mem note  ]  eager materializes scores[{NBLK},{BS},{H},{KV}] = {sc:.0f}MB (x2-3 for e,p); "
+          f"ours writes only o+lse. KV={KV} is tiny, so the fused saving is modest (both are MLA).")
 except Exception as e:  # noqa: BLE001
     print(f"[mem] skipped: {e}")
-ofb = time_ms(ours_fb)
-print(f"[fwd+bwd    ]  ours={ofb:7.3f}ms  (grads to q,k,v,sink; correctness = bit-identical to the "
-      f"validated CUDA backward)")
 
 print("\n>>> read: OURS allclose=True with small meanAbs/meanRel -> matches the vllm_ascend gold.")
 print(">>>       bf16 ~1e-2 is dtype rounding; DTYPE=float32 -> ~1e-6. To also check vs the COMPILED")

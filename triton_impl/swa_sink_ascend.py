@@ -124,7 +124,7 @@ def _swa_sink_fwd_mla_dense_kernel(
     H, HR, KV, scale,                                # HR = H*BS = rows per block
     NUM_TILES, NUM_M_TILES,                          # tiles = N * cdiv(HR, BLOCK_M)
     BS: tl.constexpr, BLOCK_M: tl.constexpr, BLOCK_N: tl.constexpr, BLOCK_K: tl.constexpr,
-    D: tl.constexpr, PV_FP16: tl.constexpr,
+    D: tl.constexpr, PV_FP16: tl.constexpr, PV_FP32: tl.constexpr,
 ):
     """D-TILED MLA-dense forward (the production block-attention shape). One program owns a block n
     and a row-tile of BLOCK_M rows = flattened (head, query) pairs — because MLA shares one KV latent
@@ -168,9 +168,9 @@ def _swa_sink_fwd_mla_dense_kernel(
         l = tl.sum(p, axis=1) + tl.math.exp2(s - m)  # denom keeps the sink term
         # P@V precision: round p to FP16 (10-bit mantissa), NOT bf16 (7-bit), when inputs are bf16 ->
         # 8x tighter (meanRel 1.2e-2 -> 1.5e-3) at the SAME Cube speed (fp16 Cube == bf16 Cube). p is
-        # in [0,1] so fp16 never overflows; v is upcast bf16->fp16 (exact for normal ranges). fp32
-        # inputs keep fp32 P@V (so the fp32 gate stays exact).
-        p = p.to(tl.float16) if PV_FP16 else p.to(V.dtype.element_ty)
+        # in [0,1] so fp16 never overflows; v is upcast bf16->fp16 (exact for normal ranges). PV_FP32
+        # forces an exact-but-slower fp32 P@V; fp32 inputs keep fp32 (so the fp32 gate stays exact).
+        p = p if PV_FP32 else (p.to(tl.float16) if PV_FP16 else p.to(V.dtype.element_ty))
 
         # ---- P@V with D-tiling -> o[M, D] chunk by chunk ----
         base_v = V + n * stride_vn
@@ -179,7 +179,7 @@ def _swa_sink_fwd_mla_dense_kernel(
             offs_k = d0 + tl.arange(0, BLOCK_K)
             vv = tl.load(base_v + offs_n[:, None] * stride_vk + offs_k[None, :] * stride_vd,
                          mask=(offs_k[None, :] < D), other=0.0)
-            vv = vv.to(tl.float16) if PV_FP16 else vv
+            vv = vv.to(tl.float32) if PV_FP32 else (vv.to(tl.float16) if PV_FP16 else vv)
             o = tl.dot(p, vv, input_precision="ieee").to(tl.float32) / l[:, None]
             tl.store(base_o + offs_m[:, None] * stride_om + offs_k[None, :] * stride_od,
                      o.to(Out.dtype.element_ty), mask=(row_ok[:, None] & (offs_k[None, :] < D)))
@@ -187,7 +187,7 @@ def _swa_sink_fwd_mla_dense_kernel(
 
 
 def swa_sink_attn_fwd_mla_dense_ascend(q, k, v, sink, scale=None, HG=None, BLOCK_M=None,
-                                       BLOCK_K=None, num_programs=None):
+                                       BLOCK_K=None, num_programs=None, pv_prec="fp16"):
     """D-tiled MLA-dense forward. q [N,H,BS,D]; k,v latent [N,KV,D]; sink [H]. Returns (o, lse) in the
     SAME layout/format as swa_sink_attn_fwd_ascend (o [N,H,BS,D], lse [N,H,BS]) so the backward
     consumes it unchanged. BLOCK_M = flattened (head,query) rows per program (M axis; the Cube-fill
@@ -208,7 +208,9 @@ def swa_sink_attn_fwd_mla_dense_ascend(q, k, v, sink, scale=None, HG=None, BLOCK
     BLOCK_M = min(BLOCK_M, triton.next_power_of_2(HR))
     BLOCK_K = 128 if BLOCK_K is None else BLOCK_K    # D-tile (512B-aligned; keeps [*,BK] on chip)
     BLOCK_N = KV                                     # KV=135 in one shot (tiny), single-pass softmax
-    pv_fp16 = (v.dtype == torch.bfloat16)            # bf16 inputs -> fp16 P@V (8x tighter, same speed)
+    # P@V precision: fp16 (default; 8x tighter than bf16, same speed) / fp32 (exact, slower) / bf16.
+    pv_fp32 = (pv_prec == "fp32")
+    pv_fp16 = (pv_prec == "fp16") and (v.dtype == torch.bfloat16)
     num_m_tiles = triton.cdiv(HR, BLOCK_M)
     num_tiles = N * num_m_tiles
     gsize = num_programs if num_programs else min(num_tiles, _num_cores(q.device))
@@ -219,7 +221,8 @@ def swa_sink_attn_fwd_mla_dense_ascend(q, k, v, sink, scale=None, HG=None, BLOCK
         v.stride(0), v.stride(1), v.stride(2),
         o.stride(0), o.stride(1), o.stride(2), o.stride(3),
         H, HR, KV, scale, num_tiles, num_m_tiles,
-        BS=BS, BLOCK_M=BLOCK_M, BLOCK_N=BLOCK_N, BLOCK_K=BLOCK_K, D=D, PV_FP16=pv_fp16,
+        BS=BS, BLOCK_M=BLOCK_M, BLOCK_N=BLOCK_N, BLOCK_K=BLOCK_K, D=D,
+        PV_FP16=pv_fp16, PV_FP32=pv_fp32,
     )
     return o, lse
 
@@ -257,7 +260,7 @@ def _num_cores(device):
 
 def swa_sink_attn_fwd_ascend(q, k, v, sink, win_left, win_right, scale=None,
                              dense=False, BLOCK_M=None, BLOCK_N=None, fp32_qk=True, num_programs=None,
-                             HG=None, BLOCK_K=None):
+                             HG=None, BLOCK_K=None, pv_prec="fp16"):
     """Ascend-shaped forward (1-D, core-capped grid-stride). Returns (o, lse). q [B,H,LQ,D];
     k,v [B,H,LK,D] (MHA) or [B,LK,D] (MLA). dense=True -> no window (Lq!=Lk allowed). Runs on CUDA
     for validation. BLOCK_M/BLOCK_N default by head_dim (small for D>=256). num_programs overrides
@@ -268,7 +271,8 @@ def swa_sink_attn_fwd_ascend(q, k, v, sink, win_left, win_right, scale=None,
     by BLOCK_K so nothing [*,512] is on chip. Windowed / MHA keep the plain flash kernel."""
     if dense and k.dim() == 3:
         return swa_sink_attn_fwd_mla_dense_ascend(q, k, v, sink, scale=scale, HG=HG, BLOCK_M=BLOCK_M,
-                                                  BLOCK_K=BLOCK_K, num_programs=num_programs)
+                                                  BLOCK_K=BLOCK_K, num_programs=num_programs,
+                                                  pv_prec=pv_prec)
     assert q.dim() == 4, "q must be [B,H,LQ,D]"
     B, H, LQ, D = q.shape
     LK = k.shape[1] if k.dim() == 3 else k.shape[2]
