@@ -22,10 +22,16 @@ try:
 except Exception as e:  # noqa: BLE001
     print(f"!! import failed: {type(e).__name__}: {e}"); raise SystemExit(1)
 
+try:
+    import torch_npu  # noqa: F401  (registers the npu device on Ascend)
+except Exception:  # noqa: BLE001
+    pass
+_DEV = ("cuda" if torch.cuda.is_available()
+        else "npu" if (hasattr(torch, "npu") and torch.npu.is_available()) else None)
+
 _TOL = {torch.float32: (1e-5, 1e-5), torch.bfloat16: (2e-2, 2e-2)}
 _DTYPES = ([{"bfloat16": torch.bfloat16, "float32": torch.float32}[os.environ["DTYPE"]]]
            if "DTYPE" in os.environ else [torch.float32, torch.bfloat16])
-_DEV = "cuda"
 
 
 def _row(dt, o, ref):
@@ -112,9 +118,9 @@ def run_gridstride(wl, wr):
 
 
 def main():
-    if not torch.cuda.is_available():
-        print("!! run on the GPU box"); raise SystemExit(1)
-    print(">>> Ascend-shaped (1-D grid) forward — correctness on CUDA vs eager/gold")
+    if _DEV is None:
+        print("!! no CUDA or NPU device found"); raise SystemExit(1)
+    print(f">>> Ascend-shaped (1-D grid) forward — correctness on {_DEV} vs eager/gold")
     BS, WIN = DSV4["block_size"], DSV4["window_size"]
     wl, wr = dspark_sas_window(BS, WIN)
     KV = WIN + BS
