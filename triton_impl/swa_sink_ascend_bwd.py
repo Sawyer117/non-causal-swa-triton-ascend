@@ -409,8 +409,9 @@ def _swa_sink_bwd_mla_dense(q, k, v, sink, o, lse, do, scale, num_programs=None,
     key dim (BLOCK_KV) and sums over row-tiles (holds dk_acc/dv_acc[BLOCK_KV,D] + Q/DO in the UB)."""
     BM_DQ = BM_DQ or 32        # dq holds qk[M,KV]+dp[M,KV] fp32, so ~32 is the UB-safe M
     BK_DQ = BK_DQ or 64        # dq D-tile
-    BM_DKDV = BM_DKDV or 16    # dk/dv row-tile M (bigger = fewer row iters, more UB)
-    BLOCK_KV = BLOCK_KV or 16  # dk/dv key-tile (bigger = fewer Q/DO re-reads, bigger dk_acc)
+    if BM_DKDV is None:        # dk/dv row-tile M (bigger = fewer row-iters); measured best at D=512
+        BM_DKDV = 32 if q.element_size() <= 2 else 16  # bf16 -> 32 (fwd+bwd 3.5ms); fp32 (4B) -> 16 UB-safe
+    BLOCK_KV = BLOCK_KV or 16  # dk/dv key-tile; capped ~16 by L0C (dk_acc[BLOCK_KV,D] Cube result, 128KB)
     q = q.contiguous()
     N, H, BS, D = q.shape
     KV = k.shape[1]

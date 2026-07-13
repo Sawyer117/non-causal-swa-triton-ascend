@@ -157,9 +157,11 @@ for name, out in (("manual(einsum)", manual()), ("OURS(triton)", ours_fwd())):
     print(f"[parity vs gold]  {name:16} allclose={c}  maxAbs={mx:.2e}  meanAbs={ma:.2e}  meanRel={mr:.2e}")
 
 # ---- fp32 sanity: same kernel in fp32 vs the fp32 gold. Ascend has no tf32, so bf16 inputs -> a
-# bf16 Cube (the ~1e-2 above is inherent dtype rounding). In fp32 the Cube is exact -> ~1e-6, which
-# proves the kernel MATH matches gold (not a bug). Skipped when already running DTYPE=float32.
-if DT is not torch.float32:
+# bf16 Cube (the ~1e-2 above is inherent dtype rounding). In fp32 the Cube is exact -> the fp32 FLOOR
+# (~1e-6 at D=512; even pure-torch eager is 1-7e-6 vs fp64 there), which proves the MATH matches gold.
+# Wrapped in a function so its fp32 tensors + autograd graph free on return (else they'd bloat the
+# memory benchmark below). Skipped when already running DTYPE=float32.
+def _self_check():
     Qf, KLf, VLf, SKf = Q.float(), KL.float(), VL.float(), SINK.float()
     khf = KLf.unsqueeze(2).expand(NBLK, KV, H, D); vhf = VLf.unsqueeze(2).expand(NBLK, KV, H, D)
     gf = torch.stack([_dspark_attention_reference(Qf[i], khf[i], vhf[i], SKf, SCALE)
@@ -218,6 +220,11 @@ if DT is not torch.float32:
         print(f"[bwd sink chk  ]  {nm:5} sink shifts grad by meanRel={(d / (r.abs() + 1e-6)).mean():.2e}")
     print("[bwd sink chk  ]  dsink is 100% sink-specific (a no-sink kernel can't produce it) -> its "
           "fp32 match above proves the sink's backward path")
+
+
+if DT is not torch.float32:
+    _self_check()
+    torch.npu.empty_cache()   # free the fp32 check tensors so they don't pollute the mem benchmark
 
 # ---- speed + memory: OURS vs the eager fallback (manual einsum) ----
 print()
