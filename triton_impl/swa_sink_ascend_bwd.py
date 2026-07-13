@@ -266,67 +266,75 @@ def _bwd_dkdv_mla_ascend_kernel(
 
 
 # ---------------------------------------------------------------------------
-# HEAD-BATCHED MLA-dense backward (matches the forward's head-batching): the MLA dk/dv gradient is
-# a sum over ALL heads (shared latent), and dq is per (head,query). Both had the M=7 starvation of
-# one head's BS queries. Here HG heads flatten into the matmul M axis (M=HG*BS) — the dk/dv kernel
-# replaces its per-head loop of tiny M=7 dots with cdiv(H,HG) batched dots. Same math as the
-# validated kernels (per-row lse/delta). Opt-in via HG; the validated per-(b,h) path stays default.
+# D-TILED / ROW-TILED MLA-dense backward (mirrors the D-tiled forward; the DEFAULT dense-MLA path).
+# Both kernels had the M=7 starvation of one head's BS queries. Here rows = flattened (head,query)
+# pairs on the matmul M axis (BLOCK_M lever). dq D-tiles the D=512 head dim so nothing [*,512] is
+# on chip (BLOCK_K); dk/dv tiles the KEY dim (small BLOCK_KV keeps dk_acc/dv_acc[BLOCK_KV,D] + Q/DO
+# in the 192KB UB — same footprint as the validated head-batched version) and sums over row-tiles.
+# Same math as the validated per-(b,h) kernels (per-row lse/delta). 1-D grid-stride, no `%`.
 # ---------------------------------------------------------------------------
 @triton.jit
 def _bwd_dq_mla_dense_ascend_kernel(
     Q, K, V, DO, Lse, Delta, DQ,
-    stride_qn, stride_qh, stride_qm, stride_qd,      # Q [N, H, BS, D]
+    stride_qn, stride_qh, stride_qm, stride_qd,      # Q [N, H, BS, D]; flat row stride = stride_qm
     stride_kn, stride_kk, stride_kd,                 # K/V [N, KV, D] latent
     stride_vn, stride_vk, stride_vd,
     stride_on, stride_oh, stride_om, stride_od,      # DO strides
     stride_gn, stride_gh, stride_gm, stride_gd,      # DQ strides
-    H, KV, scale,
-    NUM_TILES, NUM_HG,
-    HG: tl.constexpr, BS: tl.constexpr, BLOCK_M: tl.constexpr, BLOCK_N: tl.constexpr,
-    BLOCK_D: tl.constexpr, D: tl.constexpr,
+    H, HR, KV, scale,                                # HR = H*BS rows per block
+    NUM_TILES, NUM_M_TILES,
+    BS: tl.constexpr, BLOCK_M: tl.constexpr, BLOCK_N: tl.constexpr, BLOCK_K: tl.constexpr,
+    D: tl.constexpr,
 ):
     pid = tl.program_id(0)
     num_prog = tl.num_programs(0)
-    offs_d = tl.arange(0, BLOCK_D)
-    d_mask = offs_d < D
     offs_m = tl.arange(0, BLOCK_M)
+    offs_n = tl.arange(0, BLOCK_N)                   # BLOCK_N == KV (all keys valid)
     qk_scale = scale * LOG2E
 
     for tile in range(pid, NUM_TILES, num_prog):
-        n = tile // NUM_HG
-        g = tile - n * NUM_HG
-        h0 = g * HG
-        rows_valid = (tl.minimum(h0 + HG, H) - h0) * BS
-        row_ok = offs_m < rows_valid
+        n = tile // NUM_M_TILES
+        mt = tile - n * NUM_M_TILES
+        m0 = mt * BLOCK_M
+        rows = m0 + offs_m
+        row_ok = rows < HR
+        base_q = Q + n * stride_qn + m0 * stride_qm
+        base_do = DO + n * stride_on + m0 * stride_om
+        base_k = K + n * stride_kn
+        base_v = V + n * stride_vn
 
-        base_q = Q + n * stride_qn + h0 * stride_qh
-        q_block = tl.load(base_q + offs_m[:, None] * stride_qm + offs_d[None, :] * stride_qd,
-                          mask=(row_ok[:, None] & d_mask[None, :]), other=0.0)
-        base_do = DO + n * stride_on + h0 * stride_oh
-        do_block = tl.load(base_do + offs_m[:, None] * stride_om + offs_d[None, :] * stride_od,
-                           mask=(row_ok[:, None] & d_mask[None, :]), other=0.0)
-        lse_block = tl.load(Lse + (n * H + h0) * BS + offs_m, mask=row_ok, other=0.0)
-        delta_block = tl.load(Delta + (n * H + h0) * BS + offs_m, mask=row_ok, other=0.0)
-        dq_acc = tl.zeros([BLOCK_M, BLOCK_D], dtype=tl.float32)
+        # phase 1: qk[M,KV] and dp[M,KV] via D-tiling (nothing [*,512] on chip)
+        qk = tl.zeros([BLOCK_M, BLOCK_N], dtype=tl.float32)
+        dp = tl.zeros([BLOCK_M, BLOCK_N], dtype=tl.float32)
+        for d0 in range(0, D, BLOCK_K):
+            offs_k = d0 + tl.arange(0, BLOCK_K)
+            kd = offs_k[None, :] < D
+            q = tl.load(base_q + offs_m[:, None] * stride_qm + offs_k[None, :] * stride_qd,
+                        mask=(row_ok[:, None] & kd), other=0.0)
+            kk = tl.load(base_k + offs_n[:, None] * stride_kk + offs_k[None, :] * stride_kd,
+                         mask=kd, other=0.0)
+            qk += tl.dot(q, tl.trans(kk), input_precision="ieee").to(tl.float32)
+            do = tl.load(base_do + offs_m[:, None] * stride_om + offs_k[None, :] * stride_od,
+                         mask=(row_ok[:, None] & kd), other=0.0)
+            vv = tl.load(base_v + offs_n[:, None] * stride_vk + offs_k[None, :] * stride_vd,
+                         mask=kd, other=0.0)
+            dp += tl.dot(do, tl.trans(vv), input_precision="ieee").to(tl.float32)
+        qk = qk * qk_scale
+        lse_block = tl.load(Lse + n * HR + rows, mask=row_ok, other=0.0)
+        delta_block = tl.load(Delta + n * HR + rows, mask=row_ok, other=0.0)
+        p = tl.math.exp2(qk - lse_block[:, None])
+        ds = (p * (dp - delta_block[:, None])).to(K.dtype.element_ty)     # [M,KV] bf16
 
-        for n_start in range(0, KV, BLOCK_N):
-            offs_n = n_start + tl.arange(0, BLOCK_N)
-            n_valid = offs_n < KV
-            k_block = tl.load(K + n * stride_kn + offs_n[:, None] * stride_kk + offs_d[None, :] * stride_kd,
-                              mask=(n_valid[:, None] & d_mask[None, :]), other=0.0)
-            v_block = tl.load(V + n * stride_vn + offs_n[:, None] * stride_vk + offs_d[None, :] * stride_vd,
-                              mask=(n_valid[:, None] & d_mask[None, :]), other=0.0)
-            qk = tl.dot(q_block, tl.trans(k_block), input_precision="ieee").to(tl.float32) * qk_scale
-            qk = tl.where(n_valid[None, :], qk, float("-inf"))
-            p = tl.math.exp2(qk - lse_block[:, None])
-            dp = tl.dot(do_block, tl.trans(v_block), input_precision="ieee").to(tl.float32)
-            ds = p * (dp - delta_block[:, None])
-            dq_acc += tl.dot(ds.to(k_block.dtype), k_block, input_precision="ieee")
-
-        dq_acc = dq_acc * scale
-        base_dq = DQ + n * stride_gn + h0 * stride_gh
-        tl.store(base_dq + offs_m[:, None] * stride_gm + offs_d[None, :] * stride_gd,
-                 dq_acc.to(DQ.dtype.element_ty), mask=(row_ok[:, None] & d_mask[None, :]))
+        # phase 2: dq[M,D] = (ds @ K) * scale, D-tiled output
+        base_dq = DQ + n * stride_gn + m0 * stride_gm
+        for d0 in range(0, D, BLOCK_K):
+            offs_k = d0 + tl.arange(0, BLOCK_K)
+            kd = offs_k[None, :] < D
+            kk = tl.load(base_k + offs_n[:, None] * stride_kk + offs_k[None, :] * stride_kd,
+                         mask=kd, other=0.0)
+            dq_c = tl.dot(ds, kk, input_precision="ieee").to(tl.float32) * scale
+            tl.store(base_dq + offs_m[:, None] * stride_gm + offs_k[None, :] * stride_gd,
+                     dq_c.to(DQ.dtype.element_ty), mask=(row_ok[:, None] & kd))
 
 
 @triton.jit
@@ -338,94 +346,84 @@ def _bwd_dkdv_mla_dense_ascend_kernel(
     stride_on, stride_oh, stride_om, stride_od,      # DO strides
     stride_kgn, stride_kgk, stride_kgd,
     stride_vgn, stride_vgk, stride_vgd,
-    H, KV, scale,
-    NUM_TILES, NUM_N_BLOCKS, NUM_HG,
-    HG: tl.constexpr, BS: tl.constexpr, BLOCK_M: tl.constexpr, BLOCK_N: tl.constexpr,
-    BLOCK_D: tl.constexpr, D: tl.constexpr,
+    H, HR, KV, scale,
+    NUM_TILES, NUM_KV_TILES, NUM_M_TILES,
+    BS: tl.constexpr, BLOCK_M: tl.constexpr, BLOCK_KV: tl.constexpr, BLOCK_D: tl.constexpr,
+    D: tl.constexpr,
 ):
     pid = tl.program_id(0)
     num_prog = tl.num_programs(0)
     offs_d = tl.arange(0, BLOCK_D)
     d_mask = offs_d < D
-    offs_m = tl.arange(0, BLOCK_M)                   # spans HG heads x BS queries
+    offs_kv = tl.arange(0, BLOCK_KV)
+    offs_m = tl.arange(0, BLOCK_M)
     qk_scale = scale * LOG2E
 
-    for tile in range(pid, NUM_TILES, num_prog):     # tile = (block n, key-block); sum over heads
-        n = tile // NUM_N_BLOCKS
-        n_block = tile - n * NUM_N_BLOCKS
-        n_start = n_block * BLOCK_N
-        offs_n = n_start + tl.arange(0, BLOCK_N)
-        n_valid = offs_n < KV
+    for tile in range(pid, NUM_TILES, num_prog):     # tile = (block n, key-tile); sum over all rows
+        n = tile // NUM_KV_TILES
+        kt = tile - n * NUM_KV_TILES
+        kv0 = kt * BLOCK_KV
+        keys = kv0 + offs_kv
+        kv_ok = keys < KV
 
-        k_block = tl.load(K + n * stride_kn + offs_n[:, None] * stride_kk + offs_d[None, :] * stride_kd,
-                          mask=(n_valid[:, None] & d_mask[None, :]), other=0.0)
-        v_block = tl.load(V + n * stride_vn + offs_n[:, None] * stride_vk + offs_d[None, :] * stride_vd,
-                          mask=(n_valid[:, None] & d_mask[None, :]), other=0.0)
-        dk_acc = tl.zeros([BLOCK_N, BLOCK_D], dtype=tl.float32)
-        dv_acc = tl.zeros([BLOCK_N, BLOCK_D], dtype=tl.float32)
+        k_full = tl.load(K + n * stride_kn + keys[:, None] * stride_kk + offs_d[None, :] * stride_kd,
+                         mask=(kv_ok[:, None] & d_mask[None, :]), other=0.0)   # [BLOCK_KV, D]
+        v_full = tl.load(V + n * stride_vn + keys[:, None] * stride_vk + offs_d[None, :] * stride_vd,
+                         mask=(kv_ok[:, None] & d_mask[None, :]), other=0.0)
+        dk_acc = tl.zeros([BLOCK_KV, BLOCK_D], dtype=tl.float32)
+        dv_acc = tl.zeros([BLOCK_KV, BLOCK_D], dtype=tl.float32)
 
-        for g in range(0, NUM_HG):                   # head-groups: HG heads batch into M per pass
-            h0 = g * HG
-            rows_valid = (tl.minimum(h0 + HG, H) - h0) * BS
-            row_ok = offs_m < rows_valid
-            base_q = Q + n * stride_qn + h0 * stride_qh
-            q_block = tl.load(base_q + offs_m[:, None] * stride_qm + offs_d[None, :] * stride_qd,
+        for mt in range(0, NUM_M_TILES):             # row-tiles: BLOCK_M flattened (head,query) rows
+            m0 = mt * BLOCK_M
+            rows = m0 + offs_m
+            row_ok = rows < HR
+            base_q = Q + n * stride_qn + m0 * stride_qm
+            base_do = DO + n * stride_on + m0 * stride_om
+            q_full = tl.load(base_q + offs_m[:, None] * stride_qm + offs_d[None, :] * stride_qd,
+                             mask=(row_ok[:, None] & d_mask[None, :]), other=0.0)   # [M, D]
+            do_full = tl.load(base_do + offs_m[:, None] * stride_om + offs_d[None, :] * stride_od,
                               mask=(row_ok[:, None] & d_mask[None, :]), other=0.0)
-            base_do = DO + n * stride_on + h0 * stride_oh
-            do_block = tl.load(base_do + offs_m[:, None] * stride_om + offs_d[None, :] * stride_od,
-                               mask=(row_ok[:, None] & d_mask[None, :]), other=0.0)
-            lse_block = tl.load(Lse + (n * H + h0) * BS + offs_m, mask=row_ok, other=0.0)
-            delta_block = tl.load(Delta + (n * H + h0) * BS + offs_m, mask=row_ok, other=0.0)
+            lse_block = tl.load(Lse + n * HR + rows, mask=row_ok, other=0.0)
+            delta_block = tl.load(Delta + n * HR + rows, mask=row_ok, other=0.0)
 
-            qk = tl.dot(q_block, tl.trans(k_block), input_precision="ieee").to(tl.float32) * qk_scale
-            keep = row_ok[:, None] & n_valid[None, :]
+            qk = tl.dot(q_full, tl.trans(k_full), input_precision="ieee").to(tl.float32) * qk_scale
+            keep = row_ok[:, None] & kv_ok[None, :]
             qk = tl.where(keep, qk, float("-inf"))
-            p = tl.math.exp2(qk - lse_block[:, None])
-            dp = tl.dot(do_block, tl.trans(v_block), input_precision="ieee").to(tl.float32)
+            p = tl.math.exp2(qk - lse_block[:, None])                     # [M, BLOCK_KV]
+            dp = tl.dot(do_full, tl.trans(v_full), input_precision="ieee").to(tl.float32)
             ds = p * (dp - delta_block[:, None])
-            dv_acc += tl.dot(tl.trans(p.to(do_block.dtype)), do_block, input_precision="ieee")
-            dk_acc += tl.dot(tl.trans(ds.to(q_block.dtype)), q_block, input_precision="ieee")
+            dv_acc += tl.dot(tl.trans(p.to(do_full.dtype)), do_full, input_precision="ieee")
+            dk_acc += tl.dot(tl.trans(ds.to(q_full.dtype)), q_full, input_precision="ieee")
 
         dk_acc = dk_acc * scale
-        tl.store(DK + n * stride_kgn + offs_n[:, None] * stride_kgk + offs_d[None, :] * stride_kgd,
-                 dk_acc.to(DK.dtype.element_ty), mask=(n_valid[:, None] & d_mask[None, :]))
-        tl.store(DV + n * stride_vgn + offs_n[:, None] * stride_vgk + offs_d[None, :] * stride_vgd,
-                 dv_acc.to(DV.dtype.element_ty), mask=(n_valid[:, None] & d_mask[None, :]))
+        tl.store(DK + n * stride_kgn + keys[:, None] * stride_kgk + offs_d[None, :] * stride_kgd,
+                 dk_acc.to(DK.dtype.element_ty), mask=(kv_ok[:, None] & d_mask[None, :]))
+        tl.store(DV + n * stride_vgn + keys[:, None] * stride_vgk + offs_d[None, :] * stride_vgd,
+                 dv_acc.to(DV.dtype.element_ty), mask=(kv_ok[:, None] & d_mask[None, :]))
 
 
-def _headbatch_bwd_blocks(D, HG, BS):
-    """Head-batched backward tiles. dk/dv hold dk_acc+dv_acc+K+V (all [BN,D]) PLUS batched Q,DO
-    ([HG*BS,D]) on chip, so BN must stay small at big D. BLOCK_M = next_pow2(HG*BS)."""
-    bm = triton.next_power_of_2(HG * BS)
-    bn = 64
-    if D >= 512:
-        bn = 16
-    elif D >= 256:
-        bn = 32
-    return bm, bn
-
-
-def _swa_sink_bwd_mla_dense_headbatched(q, k, v, sink, o, lse, do, scale, HG, num_programs):
-    """Head-batched MLA-dense backward. q [N,H,BS,D]; k,v latent [N,KV,D]. Returns (dq,dk,dv,dsink),
-    identical semantics to swa_sink_bwd_ascend's dense-MLA path."""
+def _swa_sink_bwd_mla_dense(q, k, v, sink, o, lse, do, scale, num_programs=None,
+                            BM_DQ=32, BK_DQ=64, BM_DKDV=16, BLOCK_KV=16):
+    """D-tiled / row-tiled MLA-dense backward (the DEFAULT dense-MLA path). q [N,H,BS,D]; k,v latent
+    [N,KV,D]. Returns (dq,dk,dv,dsink). dq D-tiles the head dim (big BLOCK_M rows); dk/dv tiles the
+    key dim (BLOCK_KV) and sums over row-tiles (holds dk_acc/dv_acc[BLOCK_KV,D] + Q/DO in the UB)."""
     q = q.contiguous()
     N, H, BS, D = q.shape
     KV = k.shape[1]
-    HG = min(HG, H)
+    HR = H * BS
     do = do.contiguous()
     lse = lse.contiguous()
     delta = (do.float() * o.float()).sum(-1).contiguous()
     BLOCK_D = triton.next_power_of_2(D)
-    BLOCK_M, BLOCK_N = _headbatch_bwd_blocks(D, HG, BS)
-    num_hg = triton.cdiv(H, HG)
-    num_n_blocks = triton.cdiv(KV, BLOCK_N)
     ncores = _num_cores(q.device)
 
     def gsize(nt):
         return num_programs if num_programs else min(nt, ncores)
 
+    # dq (D-tiled, row-tiled)
     dq = torch.empty_like(q)
-    nt_dq = N * num_hg
+    num_m_tiles = triton.cdiv(HR, BM_DQ)
+    nt_dq = N * num_m_tiles
     _bwd_dq_mla_dense_ascend_kernel[(gsize(nt_dq),)](
         q, k, v, do, lse, delta, dq,
         q.stride(0), q.stride(1), q.stride(2), q.stride(3),
@@ -433,13 +431,16 @@ def _swa_sink_bwd_mla_dense_headbatched(q, k, v, sink, o, lse, do, scale, HG, nu
         v.stride(0), v.stride(1), v.stride(2),
         do.stride(0), do.stride(1), do.stride(2), do.stride(3),
         dq.stride(0), dq.stride(1), dq.stride(2), dq.stride(3),
-        H, KV, scale, nt_dq, num_hg,
-        HG=HG, BS=BS, BLOCK_M=BLOCK_M, BLOCK_N=BLOCK_N, BLOCK_D=BLOCK_D, D=D,
+        H, HR, KV, scale, nt_dq, num_m_tiles,
+        BS=BS, BLOCK_M=BM_DQ, BLOCK_N=KV, BLOCK_K=BK_DQ, D=D,
     )
 
+    # dk/dv (key-tiled, row-tile inner loop)
     dk_f = torch.empty(N, KV, D, device=q.device, dtype=k.dtype)
     dv_f = torch.empty(N, KV, D, device=q.device, dtype=v.dtype)
-    nt_kv = N * num_n_blocks
+    num_kv_tiles = triton.cdiv(KV, BLOCK_KV)
+    num_m_tiles2 = triton.cdiv(HR, BM_DKDV)
+    nt_kv = N * num_kv_tiles
     _bwd_dkdv_mla_dense_ascend_kernel[(gsize(nt_kv),)](
         q, k, v, do, lse, delta, dk_f, dv_f,
         q.stride(0), q.stride(1), q.stride(2), q.stride(3),
@@ -448,8 +449,8 @@ def _swa_sink_bwd_mla_dense_headbatched(q, k, v, sink, o, lse, do, scale, HG, nu
         do.stride(0), do.stride(1), do.stride(2), do.stride(3),
         dk_f.stride(0), dk_f.stride(1), dk_f.stride(2),
         dv_f.stride(0), dv_f.stride(1), dv_f.stride(2),
-        H, KV, scale, nt_kv, num_n_blocks, num_hg,
-        HG=HG, BS=BS, BLOCK_M=BLOCK_M, BLOCK_N=BLOCK_N, BLOCK_D=BLOCK_D, D=D,
+        H, HR, KV, scale, nt_kv, num_kv_tiles, num_m_tiles2,
+        BS=BS, BLOCK_M=BM_DKDV, BLOCK_KV=BLOCK_KV, BLOCK_D=BLOCK_D, D=D,
     )
 
     LOG2E_F = 1.4426950408889634
@@ -462,10 +463,11 @@ def swa_sink_bwd_ascend(q, k, v, sink, o, lse, do, win_left, win_right, dense, s
     """Ascend-shaped fused backward (1-D core-capped grid-stride). Returns (dq, dk, dv, dsink).
     Same signature/semantics as swa_sink_bwd; GPU-testable. BLOCK_M/BLOCK_N default by head_dim.
 
-    HG (opt-in): for the MLA-dense production shape, dispatch to the head-batched backward (HG heads
-    batch into the matmul M axis, mirroring the forward). Only valid for dense + MLA; ignored else."""
-    if HG and dense and k.dim() == 3:
-        return _swa_sink_bwd_mla_dense_headbatched(q, k, v, sink, o, lse, do, scale, HG, num_programs)
+    The MLA-dense production shape (dense + k.dim()==3) uses the D-tiled / row-tiled backward by
+    default (rows = flattened (head,query) pairs on the matmul M axis; dq D-tiles the head dim).
+    Windowed / MHA keep the validated per-(b,h) kernels. HG is accepted for API compat (ignored)."""
+    if dense and k.dim() == 3:
+        return _swa_sink_bwd_mla_dense(q, k, v, sink, o, lse, do, scale, num_programs=num_programs)
     B, H, LQ, D = q.shape
     BLOCK_M, BLOCK_N = _default_blocks(D, BLOCK_M, BLOCK_N)
     BLOCK_M, BLOCK_N = _bwd_safe_blocks(D, BLOCK_M, BLOCK_N)   # keep K+V (x multi-buffer) in L1

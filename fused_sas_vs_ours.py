@@ -112,9 +112,9 @@ def ours_fb():
     qk = Q.transpose(1, 2).contiguous()
     o, lse = swa_sink_attn_fwd_ascend(qk, KL, VL, SINK, 0, 0, scale=SCALE, dense=True,
                                       BLOCK_M=BM, HG=HG, BLOCK_K=BK)
-    # HG head-batches the backward too; else it keeps its own L1-safe tiles (don't force BM/BN here).
+    # backward is now the D-tiled/row-tiled MLA-dense path by default (its own internal tiles).
     swa_sink_bwd_ascend(qk, KL, VL, SINK, o, lse, DO.transpose(1, 2).contiguous(),
-                        0, 0, True, SCALE, HG=HG)
+                        0, 0, True, SCALE)
 
 
 def cmp(x, ref):
