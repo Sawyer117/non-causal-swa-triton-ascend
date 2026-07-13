@@ -159,7 +159,8 @@ def bench_dense_mla(N, BS, KV, H, D):
         def s():
             o, lse = swa_sink_attn_fwd_ascend(qk, kL, vL, sink, 0, 0, scale=scale, dense=True,
                                               num_programs=npg, BLOCK_M=bm, BLOCK_N=bn, HG=HG_ENV)
-            swa_sink_bwd_ascend(qk, kL, vL, sink, o, lse, do, 0, 0, True, scale, num_programs=npg)
+            swa_sink_bwd_ascend(qk, kL, vL, sink, o, lse, do, 0, 0, True, scale, num_programs=npg,
+                                HG=HG_ENV)
         return s
 
     print(f"\n### dense MLA (production)  N={N} BS={BS} KV={KV} H={H} D={D}  dtype={DT}  tile=({bm},{bn})"

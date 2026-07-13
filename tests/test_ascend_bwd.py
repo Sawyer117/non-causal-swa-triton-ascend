@@ -71,7 +71,7 @@ def _eager_grads(kind, q, k, v, sink, do, wl, wr, N=None, KV=None, H=None, D=Non
 
 
 def run(tag, *, mla=False, dense=False, B=2, H=8, L=384, D=64, N=4, BS=7, KV=135,
-        wl=134, wr=6, bm=32, bn=32):
+        wl=134, wr=6, bm=32, bn=32, hg=None):
     torch.manual_seed(0)
     scale = D ** -0.5
     if dense:
@@ -85,7 +85,8 @@ def run(tag, *, mla=False, dense=False, B=2, H=8, L=384, D=64, N=4, BS=7, KV=135
     k = torch.randn(*ksh, device=_DEV, dtype=torch.float32)
     v = torch.randn(*ksh, device=_DEV, dtype=torch.float32)
     sink = torch.randn(H, device=_DEV, dtype=torch.float32)
-    print(f"\n### {tag}  {'MLA' if mla else 'MHA'} {'dense' if dense else 'windowed'}  tile=({bm},{bn})")
+    print(f"\n### {tag}  {'MLA' if mla else 'MHA'} {'dense' if dense else 'windowed'}"
+          f"{f'  HG={hg}' if hg else ''}  tile=({bm},{bn})")
     ok = True
     for dt in _DTYPES:
         atol, rtol = _TOL[dt]
@@ -93,11 +94,11 @@ def run(tag, *, mla=False, dense=False, B=2, H=8, L=384, D=64, N=4, BS=7, KV=135
         ref = _eager_grads("dense" if dense else "windowed", qd, kd, vd, sink, dod,
                            0 if dense else wl, 0 if dense else wr, N=N, KV=KV, H=H, D=D)
         o, lse = swa_sink_attn_fwd_ascend(qd, kd, vd, sink, 0 if dense else wl, 0 if dense else wr,
-                                          scale=scale, dense=dense, BLOCK_M=bm, BLOCK_N=bn)
+                                          scale=scale, dense=dense, BLOCK_M=bm, BLOCK_N=bn, HG=hg)
         print(f"  dtype={str(dt).replace('torch.','')}  (Ascend bwd vs eager autograd, same inputs)")
         for npg in (None, 1, 3):
             g = swa_sink_bwd_ascend(qd, kd, vd, sink, o, lse, dod, 0 if dense else wl,
-                                    0 if dense else wr, dense, scale, bm, bn, num_programs=npg)
+                                    0 if dense else wr, dense, scale, bm, bn, num_programs=npg, HG=hg)
             print(f"    num_programs={npg}")
             for nm, a, b in zip("q k v sink".split(), g, ref):
                 ok &= _cmp(nm, a, b, atol, rtol)
@@ -116,6 +117,11 @@ def main():
     ok &= run("[asym-mla] windowed MLA", mla=True, B=2, H=8, L=384, D=64, wl=wl, wr=wr)
     ok &= run("[gold] dense", dense=True, N=4, BS=BS, KV=KV, H=8, D=64, bm=16, bn=16)
     ok &= run("[gold-mla] dense MLA", dense=True, mla=True, N=4, BS=BS, KV=KV, H=8, D=64, bm=16, bn=16)
+    # head-batched MLA-dense backward (HG heads -> M=HG*BS); H not divisible by HG on purpose
+    ok &= run("[hg-mla] dense MLA head-batched", dense=True, mla=True, N=4, BS=BS, KV=KV, H=8, D=64,
+              bm=16, bn=16, hg=3)
+    ok &= run("[hg-real] DSV4 head-batched", dense=True, mla=True, N=2, BS=BS, KV=KV,
+              H=DSV4["num_heads"], D=DSV4["head_dim"], bm=16, bn=16, hg=2)
     ok &= run("[real] DSV4 H=64 D=512", B=1, H=DSV4["num_heads"], L=256, D=DSV4["head_dim"],
               wl=wl, wr=wr, bm=16, bn=16)
     print("\n" + ("PASS: 1-D-grid Ascend backward matches eager autograd grads."

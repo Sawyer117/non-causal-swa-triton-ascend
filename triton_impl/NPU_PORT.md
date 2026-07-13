@@ -36,8 +36,14 @@ backend lowering + on-device perf tuning remain for the A3. The CUDA kernels
   - Forward BN sweep (flash kernel): default(16,16) 0.10x → **BN=135 (KV in one key-block) 0.44x**;
     bigger BM *hurt* (BM=32 worse). So one big QK matmul >> nine tiny ones.
   - **Head-batched MLA-dense forward** (`_swa_sink_fwd_mla_dense_kernel`, opt-in via `HG=`): the KV
-    latent is shared across all H heads, so HG heads batch into M (**M=HG*BS** not 7) and KV fits one
-    key-block → single-pass softmax, per-row sink gather. Sweep `HG=8 python fused_sas_vs_ours.py`.
+    latent is shared across all H heads, so HG heads batch into M (**M=HG*BS** not 7). Flash-style
+    (staged small BLOCK_N; acc[M,D]fp32 in the 192KB UB caps M~=32 at D=512). **HG=2 → fwd 0.58x
+    (from 0.44), fwd+bwd 17.1ms (from 23.4).** HG=2 already fills the Cube's 16-wide M axis (14/16 vs
+    the flash 7/16); HG>=3 (BLOCK_M=32) overflows UB unless BLOCK_N shrinks (auto: BN=16 at D=512).
+  - **Backward is now the bottleneck** (~15.8ms of the 17.1ms). Head-batched too (opt-in `HG=`):
+    `_bwd_dq_mla_dense_ascend_kernel` + `_bwd_dkdv_mla_dense_ascend_kernel` — the dk/dv kernel's
+    per-head loop of tiny M=7 dots becomes cdiv(H,HG) batched M=HG*BS dots (dk/dv sum over all heads,
+    the shared-latent gradient). BN kept small (16 at D=512) — it holds dk_acc+dv_acc+K+V+Q+DO.
 - **Backward L1 ("cbuf") limit = 512KB.** `_bwd_dq_ascend_kernel` overflows at BLOCK_N>=128 with
   D=512 (loads K[BN,D]+V[BN,D], multi-buffer doubles it): `cbuf overflow 4718592 > 4194304 bits`. So
   fwd and bwd use **independent tiles**; `_bwd_safe_blocks` caps bwd BN (D>=512 → BN<=32) so a

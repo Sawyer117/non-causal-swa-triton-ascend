@@ -199,9 +199,14 @@ def swa_sink_attn_fwd_mla_dense_ascend(q, k, v, sink, scale=None, HG=4, BLOCK_N=
     o = torch.empty_like(q)
     lse = torch.empty(N, H, BS, device=q.device, dtype=torch.float32)
     BLOCK_D = triton.next_power_of_2(D)
-    BLOCK_N = 64 if BLOCK_N is None else BLOCK_N        # small staged key-block (fits L1/UB at D=512)
     HG = min(HG, H)
     BLOCK_M = triton.next_power_of_2(HG * BS)
+    if BLOCK_N is None:                                 # staged key-block; shrink it as M grows so
+        BLOCK_N = 64                                    # acc[M,D]fp32 + K/V[BN,D] stay in the 192KB UB
+        if D >= 512 and BLOCK_M > 16:
+            BLOCK_N = 16
+        elif D >= 256 and BLOCK_M > 32:
+            BLOCK_N = 32
     num_hg = triton.cdiv(H, HG)
     num_tiles = N * num_hg
     gsize = num_programs if num_programs else min(num_tiles, _num_cores(q.device))

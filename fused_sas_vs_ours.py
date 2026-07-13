@@ -111,9 +111,9 @@ def ours_fb():
     qk = Q.transpose(1, 2).contiguous()
     o, lse = swa_sink_attn_fwd_ascend(qk, KL, VL, SINK, 0, 0, scale=SCALE, dense=True,
                                       BLOCK_M=BM, BLOCK_N=BN, HG=HG)
-    # backward keeps its own L1-safe tiles (big BN overflows the bwd's cbuf); don't force BM/BN here.
+    # HG head-batches the backward too; else it keeps its own L1-safe tiles (don't force BM/BN here).
     swa_sink_bwd_ascend(qk, KL, VL, SINK, o, lse, DO.transpose(1, 2).contiguous(),
-                        0, 0, True, SCALE)
+                        0, 0, True, SCALE, HG=HG)
 
 
 def cmp(x, ref):
