@@ -182,6 +182,43 @@ if DT is not torch.float32:
           f"{(ds / (gf.abs() + 1e-6)).mean():.2e} maxAbs={ds.max():.2e}  -> fp32 parity ({mr:.1e}) "
           f"<< this, so the sink IS verified (bf16 gate alone can't see it)")
 
+    # ---- BACKWARD fp32 + sink self-check (the analog for gradients). Our dq/dk/dv/dsink (fp32) vs
+    # eager-autograd grads; dsink is 100% sink-specific (a no-sink kernel can't produce it at all),
+    # so its fp32 match is a DIRECT proof of the sink's backward path.
+    def _eager_out(q_, kl_, vl_, sk_, with_sink=True):
+        s = torch.einsum("nqhd,nkd->nqhk", q_, kl_) * SCALE
+        skv = sk_.view(1, 1, H, 1)
+        smx = s.max(-1, keepdim=True).values
+        smax = torch.maximum(smx, skv) if with_sink else smx        # no-sink control must not touch sk
+        e = torch.exp(s - smax)
+        denom = e.sum(-1, keepdim=True) + (torch.exp(skv - smax) if with_sink else 0.0)
+        return torch.einsum("nqhk,nkd->nqhd", e / denom, vl_)       # [N,BS,H,D]
+
+    def _grads(with_sink):
+        xs = [t.detach().clone().requires_grad_(True) for t in (Qf, KLf, VLf, SKf)]
+        (_eager_out(*xs, with_sink=with_sink) * DO.float()).sum().backward()
+        return xs  # [q, kl, vl, sk] with .grad
+
+    ref = _grads(True)                                              # eager autograd grads WITH sink
+    o32, lse32 = swa_sink_attn_fwd_ascend(Qf.transpose(1, 2).contiguous(), KLf, VLf, SKf, 0, 0,
+                                          scale=SCALE, dense=True, BLOCK_M=BM, HG=HG, BLOCK_K=BK)
+    # default (UB-safe) tiles here: fp32 is 2x the memory, and the math is tile-independent, so an
+    # aggressive perf-sweep tile that's fine in bf16 could overflow in fp32 — don't risk the check.
+    dq, dk, dv, dsink = swa_sink_bwd_ascend(Qf.transpose(1, 2).contiguous(), KLf, VLf, SKf, o32, lse32,
+                                            DO.float().transpose(1, 2).contiguous(), 0, 0, True, SCALE)
+    ours = {"dq": dq.transpose(1, 2), "dk": dk, "dv": dv, "dsink": dsink}
+    print()
+    for nm, r in zip(("dq", "dk", "dv", "dsink"), (g.grad for g in ref)):
+        c, mx, ma, mr2 = cmp(ours[nm], r)
+        print(f"[bwd fp32      ]  {nm:5} allclose={c}  maxAbs={mx:.2e}  meanAbs={ma:.2e}  meanRel={mr2:.2e}")
+
+    ns = _grads(False)                                              # eager grads WITHOUT the sink
+    for nm, r, n in zip(("dq", "dk", "dv"), (g.grad for g in ref), (x.grad for x in ns)):
+        d = (r - n).abs()
+        print(f"[bwd sink chk  ]  {nm:5} sink shifts grad by meanRel={(d / (r.abs() + 1e-6)).mean():.2e}")
+    print("[bwd sink chk  ]  dsink is 100% sink-specific (a no-sink kernel can't produce it) -> its "
+          "fp32 match above proves the sink's backward path")
+
 # ---- speed + memory: OURS vs the eager fallback (manual einsum) ----
 print()
 mf = time_ms(lambda: manual())
