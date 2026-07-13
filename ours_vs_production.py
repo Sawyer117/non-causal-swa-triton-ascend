@@ -134,27 +134,45 @@ def main():
           f"block={BS} blocks={NBLK}  MLA shared-KV  dtype={DT}")
     print(f">>> _dspark_sas_window(block={BS}, window={WIN}) = mode={mode}, win_left={wl}, win_right={wr}\n")
 
-    if dsa._get_dspark_sas_ops(s["q"]) is None:   # noqa: SLF001
-        print("!! production SAS op NOT built (torch.ops._C_ascend.npu_sparse_attn_sharedkv missing).\n"
-              "   Build vllm_ascend with sparse_attn_sharedkv, or this can only compare OURS vs REF.")
-    with _override(_get_dspark_attention_custom_op=lambda q: None):
-        fused = run_entry(s)                                          # PRODUCTION
+    sas_available = dsa._get_dspark_sas_ops(s["q"]) is not None       # noqa: SLF001
+
+    # REF (fp32 reference loop) + OURS are always available -> correctness check.
     with _override(_get_dspark_attention_custom_op=lambda q: None, _get_dspark_sas_ops=lambda q: None):
-        ref = run_entry(s)                                            # REFERENCE
+        ref = run_entry(s)
     ours_o = ours(qb, kvl, sink)
     torch.npu.synchronize()
+    c, mx, ma, mr = cmp(ours_o, ref)
+    print(f"[parity]  OURS vs REF   allclose={c}  maxAbs={mx:.2e}  meanAbs={ma:.2e}  meanRel={mr:.2e}"
+          f"   (correctness; bf16 ~1e-2 is dtype, DTYPE=float32 -> ~1e-6)")
 
-    for name, a, b in (("OURS   vs PROD", ours_o, fused), ("OURS   vs REF ", ours_o, ref),
-                       ("PROD   vs REF ", fused, ref)):
+    if not sas_available:
+        # DO NOT print a "production" speedup here: with the op missing, the entry falls back to the
+        # slow per-block reference LOOP, so any "production" number would be vs that loop (meaningless).
+        to = time_ms(lambda: ours(qb, kvl, sink))
+        print(f"[fwd speed]  ours={to:7.3f}ms   (our kernel alone)")
+        print("\n!! production SAS op (npu_sparse_attn_sharedkv) is NOT built in this env, so there is\n"
+              "   NO real production baseline to compare against. The FUSED entry would silently fall\n"
+              "   back to the per-block fp32 reference loop (~100ms of Python) — comparing to THAT is\n"
+              "   meaningless (it would print a fake ~100x+ 'speedup' and PROD-vs-REF=0.0).\n"
+              "   Build vllm-ascend from source on the dspark-dsv4 branch (install step 4) so\n"
+              "   torch.ops._C_ascend.npu_sparse_attn_sharedkv registers, then re-run for the REAL number.\n"
+              "   Check:  python -c \"import torch,torch_npu; print(hasattr(torch.ops._C_ascend,"
+              "'npu_sparse_attn_sharedkv'))\"")
+        return
+
+    # SAS op present -> real production comparison.
+    with _override(_get_dspark_attention_custom_op=lambda q: None):
+        fused = run_entry(s)
+    torch.npu.synchronize()
+    for name, a, b in (("OURS vs PROD", ours_o, fused), ("PROD vs REF ", fused, ref)):
         c, mx, ma, mr = cmp(a, b)
         print(f"[parity]  {name}  allclose={c}  maxAbs={mx:.2e}  meanAbs={ma:.2e}  meanRel={mr:.2e}")
-
     print()
     tp = time_ms(lambda: run_entry(s))
     to = time_ms(lambda: ours(qb, kvl, sink))
     print(f"[fwd speed]  production={tp:7.3f}ms   ours={to:7.3f}ms   speedup {tp / to:4.2f}x")
-    print("\n>>> OURS vs PROD allclose=True => our Triton kernel matches the production op (bf16 ~1e-2 is "
-          "dtype; DTYPE=float32 -> ~1e-6). speedup>1 => our Triton is faster than the compiled op.")
+    print("\n>>> OURS vs PROD allclose=True => our Triton kernel matches the production op. "
+          "speedup>1 => our Triton is faster than the compiled op.")
 
 
 if __name__ == "__main__":
