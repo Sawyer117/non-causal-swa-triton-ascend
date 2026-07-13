@@ -170,6 +170,18 @@ if DT is not torch.float32:
     print(f"[parity fp32   ]  OURS(triton)     allclose={c}  maxAbs={mx:.2e}  meanAbs={ma:.2e}  "
           f"meanRel={mr:.2e}   (math check; bf16 diff above is dtype rounding, not a bug)")
 
+    # ---- sink SENSITIVITY: how much does the sink actually move the output? The sink is 1 virtual
+    # key among KV=135, so its effect (~0.7%) is the SAME ORDER as bf16 noise -> a kernel that DROPS
+    # the sink would still pass the bf16 gate. Only the fp32 parity above (orders of magnitude below
+    # this) can prove the sink is really there. This line makes that explicit.
+    s_ns = torch.einsum("nqhd,nkd->nqhk", Qf, KLf) * SCALE          # [N,BS,H,KV]
+    e_ns = torch.exp(s_ns - s_ns.max(-1, keepdim=True).values)
+    o_ns = torch.einsum("nqhk,nkd->nqhd", e_ns / e_ns.sum(-1, keepdim=True), VLf)  # NO sink in denom
+    ds = (gf - o_ns).abs()                                          # gf and o_ns are both [N,BS,H,D]
+    print(f"[sink check    ]  dropping the sink shifts the output by meanRel="
+          f"{(ds / (gf.abs() + 1e-6)).mean():.2e} maxAbs={ds.max():.2e}  -> fp32 parity ({mr:.1e}) "
+          f"<< this, so the sink IS verified (bf16 gate alone can't see it)")
+
 # ---- speed + memory: OURS vs the eager fallback (manual einsum) ----
 print()
 mf = time_ms(lambda: manual())
