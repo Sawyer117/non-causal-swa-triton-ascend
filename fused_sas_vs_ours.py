@@ -21,11 +21,13 @@ RUN on the A3 (env dspark-dsv4-base, vllm_ascend installed):
     NBLK=512 python fused_sas_vs_ours.py             # full scale
 
 PERF TUNING (the forward was Cube-starved at M=7 = one head's BS queries):
-    HG=8  python fused_sas_vs_ours.py                # head-batched fwd: 8 heads -> M=8*7=56
-    HG=16 python fused_sas_vs_ours.py                # M=112 (sweep HG in {4,8,16,32})
-  HG dispatches the MLA-dense head-batched kernel (all H heads share the KV latent, so they batch
-  into the matmul M axis + KV fits one key-block => single-pass). Backward auto-uses L1-safe tiles.
-  Without HG, BN=<n> still tunes the flash forward (BN=135 = KV in one key-block).
+    HG=2 python fused_sas_vs_ours.py                 # head-batched fwd: 2 heads -> M=2*7=14
+    HG=4 python fused_sas_vs_ours.py                 # M=28 (pad 32); sweep HG in {2,3,4}
+  HG dispatches the MLA-dense head-batched kernel: all H heads share the KV latent, so HG heads
+  batch into the matmul M axis (M=HG*BS instead of 7). Flash-style (staged K/V, small BLOCK_N); the
+  acc[M,D] fp32 lives in the 192KB UB so M (=HG*BS padded) caps ~32 at D=512 -> keep HG<=4 (HG>=8
+  overflows UB). BN=<n> tunes the staged key-block (default 64). Backward auto-uses L1-safe tiles.
+  Without HG, BN=135 tunes the plain flash forward (whole KV in one key-block).
 """
 import os
 import time

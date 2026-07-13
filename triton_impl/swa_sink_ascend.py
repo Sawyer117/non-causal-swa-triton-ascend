@@ -128,18 +128,16 @@ def _swa_sink_fwd_mla_dense_kernel(
 ):
     """HEAD-BATCHED MLA-dense forward (the production block-attention shape). One program handles
     one (block n, head-group g): it flattens HG heads x BS queries into the matmul M axis (M=HG*BS
-    instead of 7) so the Cube isn't starved, and — because MLA shares one KV latent across all H
-    heads — every row attends the SAME K/V[KV,D]. KV fits one key-block (BLOCK_N>=KV) so it's a
-    SINGLE-PASS softmax (no online rescale). Per-row sink: row r -> head h0 + r//BS (fp32 logit in
-    the denominator, absent from P@V). Same math/lse as the flash kernel; separate kernel keeps the
-    validated path untouched. 1-D core-capped grid-stride, no `%`."""
+    instead of 7) so the Cube isn't starved on the M axis — because MLA shares one KV latent across
+    all H heads, every row attends the SAME K/V[KV,D]. Per-row sink: row r -> head h0 + r//BS (fp32
+    logit in the denominator, absent from P@V). Uses the SAME flash online-softmax + staged K/V
+    n-loop as the validated kernel (small BLOCK_N so K/V don't blow the 512KB L1, and acc[M,D] fits
+    the 192KB UB — which caps M ~= 32 at D=512, i.e. HG~=4). Same math/lse. 1-D grid-stride, no `%`."""
     pid = tl.program_id(0)
     num_prog = tl.num_programs(0)
     offs_d = tl.arange(0, BLOCK_D)
     d_mask = offs_d < D
     offs_m = tl.arange(0, BLOCK_M)
-    offs_n = tl.arange(0, BLOCK_N)
-    n_valid = offs_n < KV
     qk_scale = scale * LOG2E
 
     for tile in range(pid, NUM_TILES, num_prog):
@@ -155,33 +153,41 @@ def _swa_sink_fwd_mla_dense_kernel(
                           mask=(row_ok[:, None] & d_mask[None, :]), other=0.0)
         # per-row sink logit: head(row) = h0 + row // BS  (no `%`; masked gather)
         sink_val = tl.load(Sink + (h0 + offs_m // BS), mask=row_ok, other=0.0).to(tl.float32)
-        s = sink_val * LOG2E
 
-        k_block = tl.load(K + n * stride_kn + offs_n[:, None] * stride_kk + offs_d[None, :] * stride_kd,
-                          mask=(n_valid[:, None] & d_mask[None, :]), other=0.0)
-        qk = tl.dot(q_block, tl.trans(k_block), input_precision="ieee").to(tl.float32) * qk_scale
-        qk = tl.where(n_valid[None, :], qk, float("-inf"))
+        m_i = sink_val * LOG2E                                # seed sink as a per-row virtual key
+        l_i = tl.full([BLOCK_M], 1.0, dtype=tl.float32)
+        acc = tl.zeros([BLOCK_M, BLOCK_D], dtype=tl.float32)
 
-        m = tl.maximum(tl.max(qk, axis=1), s)                # rowmax including the sink virtual key
-        p = tl.math.exp2(qk - m[:, None])
-        l = tl.sum(p, axis=1) + tl.math.exp2(s - m)          # denom keeps the sink term
+        for n_start in range(0, KV, BLOCK_N):                # staged K/V (keeps L1/UB bounded)
+            offs_n = n_start + tl.arange(0, BLOCK_N)
+            n_valid = offs_n < KV
+            k_block = tl.load(K + n * stride_kn + offs_n[:, None] * stride_kk + offs_d[None, :] * stride_kd,
+                              mask=(n_valid[:, None] & d_mask[None, :]), other=0.0)
+            qk = tl.dot(q_block, tl.trans(k_block), input_precision="ieee").to(tl.float32) * qk_scale
+            qk = tl.where(n_valid[None, :], qk, float("-inf"))
+            m_ij = tl.maximum(m_i, tl.max(qk, axis=1))
+            p = tl.math.exp2(qk - m_ij[:, None])
+            alpha = tl.math.exp2(m_i - m_ij)
+            l_i = l_i * alpha + tl.sum(p, axis=1)
+            v_block = tl.load(V + n * stride_vn + offs_n[:, None] * stride_vk + offs_d[None, :] * stride_vd,
+                              mask=(n_valid[:, None] & d_mask[None, :]), other=0.0)
+            acc = acc * alpha[:, None] + tl.dot(p.to(v_block.dtype), v_block, input_precision="ieee")
+            m_i = m_ij
 
-        v_block = tl.load(V + n * stride_vn + offs_n[:, None] * stride_vk + offs_d[None, :] * stride_vd,
-                          mask=(n_valid[:, None] & d_mask[None, :]), other=0.0)
-        o = tl.dot(p.to(v_block.dtype), v_block, input_precision="ieee") / l[:, None]
-
+        o = acc / l_i[:, None]
         base_o = Out + n * stride_on + h0 * stride_oh
         tl.store(base_o + offs_m[:, None] * stride_om + offs_d[None, :] * stride_od,
                  o.to(Out.dtype.element_ty), mask=(row_ok[:, None] & d_mask[None, :]))
-        tl.store(Lse + (n * H + h0) * BS + offs_m, m + tl.log2(l), mask=row_ok)
+        tl.store(Lse + (n * H + h0) * BS + offs_m, m_i + tl.log2(l_i), mask=row_ok)
 
 
-def swa_sink_attn_fwd_mla_dense_ascend(q, k, v, sink, scale=None, HG=8, BLOCK_N=None,
+def swa_sink_attn_fwd_mla_dense_ascend(q, k, v, sink, scale=None, HG=4, BLOCK_N=None,
                                        num_programs=None):
     """Head-batched MLA-dense forward. q [N,H,BS,D]; k,v latent [N,KV,D]; sink [H]. Returns (o, lse)
     in the SAME layout/format as swa_sink_attn_fwd_ascend (o [N,H,BS,D], lse [N,H,BS]) so the
-    existing backward consumes it unchanged. Single-pass: needs the whole KV in one key-block
-    (BLOCK_N>=KV; default next_pow2(KV)). HG = heads batched into M per program (M=HG*BS)."""
+    existing backward consumes it unchanged. HG = heads batched into the matmul M axis (M=HG*BS).
+    Flash online softmax with staged K/V (BLOCK_N default 64) so it stays in L1/UB. Note: acc[M,D]
+    is fp32 in the 192KB UB, so M (=HG*BS, padded) is capped ~32 at D=512 -> keep HG<=4 there."""
     assert q.dim() == 4 and k.dim() == 3, "head-batched path is MLA dense: q[N,H,BS,D], kv[N,KV,D]"
     # heads are flattened into M via a single row stride (stride_qm), so the [H,BS,D] block must be
     # C-contiguous (stride_qh == BS*stride_qm). The harness passes .contiguous(); enforce it here.
@@ -193,8 +199,7 @@ def swa_sink_attn_fwd_mla_dense_ascend(q, k, v, sink, scale=None, HG=8, BLOCK_N=
     o = torch.empty_like(q)
     lse = torch.empty(N, H, BS, device=q.device, dtype=torch.float32)
     BLOCK_D = triton.next_power_of_2(D)
-    BLOCK_N = triton.next_power_of_2(KV) if BLOCK_N is None else BLOCK_N
-    assert BLOCK_N >= KV, "head-batched path needs the whole KV in one key-block (BLOCK_N>=KV)"
+    BLOCK_N = 64 if BLOCK_N is None else BLOCK_N        # small staged key-block (fits L1/UB at D=512)
     HG = min(HG, H)
     BLOCK_M = triton.next_power_of_2(HG * BS)
     num_hg = triton.cdiv(H, HG)
