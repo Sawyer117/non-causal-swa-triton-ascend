@@ -209,3 +209,25 @@ node has `9.0.0.0430`. A too-low CANN fails to BUILD or fails at dispatch (cf. t
   `rm -rf build csrc/build` and clear the installed custom-opp package for these two ops, then rebuild.
 - `BS=5 python diag_sas_window.py` per-block-position breakdown (`6de0081`): garbage-overshoot from the
   missing clamp should make the error uneven across p0..p4.
+
+### 8.1 CONFIRMED on the node (2026-07-14): stale AscendC op package, source is fine
+
+- `grep 'Min(tempLoopInfo.oriMaskRight' <built csrc>/.../swa_kernel.h` → **line 692 present**: the
+  build source HAS the clamp. The build-time commit `381bd0e` also has it (checked `/tmp/user-va`). So
+  it is NOT a wrong-commit / missing-source problem.
+- The op nonetheless misbehaves (`PROD vs REF maxAbs 1.05`, unchanged), and
+  `pip show vllm_ascend` = `0.1.dev3893+g381bd0e35.d20260714` — built from commit `381bd0e35` with a
+  **dirty** tree (`.d`), while the checkout is now detached at a **different** commit `60365071`.
+  ⇒ the installed **compiled AscendC operator package is stale** vs the source (the clamp never made
+  it into the compiled kernel). Root enabler: setup.py:297 "ccache and ninja can not be applied at
+  ascendc kernels" — incremental rebuilds do NOT recompile AscendC kernels on source change.
+- The compiled AscendC ops live in `vllm_ascend/_cann_ops_custom/vendors/custom_transformer/`
+  (rpath at CMakeLists.txt:198). **Fix = force-recompile them:**
+  ```
+  cd /home/a00652497/dspark_austin/installation/vllm-ascend-v4
+  rm -rf build csrc/build vllm_ascend/_cann_ops_custom   # delete the STALE AscendC op package
+  pip install -e . --no-deps --no-build-isolation --no-cache-dir
+  ```
+  then re-run `BS=5 python ours_vs_production.py` → PROD vs REF should collapse to ~1e-4/1e-2.
+- This fully reconciles "inference gets good AL" too: the model was likely run against a correctly
+  (fully) built package elsewhere, or before the source moved; THIS install's kernel package is stale.
