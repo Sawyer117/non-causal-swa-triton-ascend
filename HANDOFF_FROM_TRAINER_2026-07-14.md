@@ -1,65 +1,96 @@
-# Handoff from the DSV4-DSpark trainer session — 2026-07-14
+# Handoff from the DSV4-DSpark trainer session — 2026-07-14 (AMENDED)
 
-From the main trainer work (`Sawyer117/speculators @ feat/dsv4-dspark`). Two items: (1) your
-causal-127 SAS build diagnosis is **sound — no correction**; (2) a `block_size` number changed
-under you today (an off-by-one fix), so your README §3 is now slightly stale.
+> **This supersedes an earlier same-day version** in which I wrote "your causal-127 diagnosis
+> holds." After reading the **actual va-src source**, that was overclaimed. Below is the
+> source-verified picture, **with my decision trail** (two corrections) so you can see how I got
+> here and check every step yourself.
 
-## 1. Your PROD-vs-REF (causal-127) diagnosis holds — confirmed, no change
+## TL;DR (calibrated)
 
-Reviewed `diag_sas_window.py` + `fused_sas_vs_reference_parity.py`. The method is right and the
-conclusion stands:
+- **The SAS op your draft path uses is `non-causal` in OUR fork's source (correct).** #11196 did
+  that — the user's doubt about "#11196 fixed SAS" was misplaced on that point.
+- Your diag docstring quotes the **upstream** `oriWinRight != 0` (causal) assert; but our va-src at
+  that **same file:line is already `< 0`** (patched). So if your node's `.so` computes causal-127,
+  it was built from the **wrong/upstream source** (or a partial build) — the source is non-causal.
+- The **1.39 is NOT proven** to be a causal window bug. It's either a wrong-source/stale build **or**
+  a non-window artifact (dtype path / cache assembly / scenario) — i.e. your diag's own "PROD matches
+  non-causal → look elsewhere" branch. **Settle it: run `diag_sas_window.py` at `BS=5`** (DSV4's real
+  block; `BS=7` is the Qwen3 block7 case). **Don't default to "causal."**
+- Your **Triton kernel is unaffected and correct** (matches the non-causal ref at fp32 5.96e-7).
 
-- PROD (compiled SAS op) and **both** reference windows carry the **same sink** (diag lines
-  105-108), so the ~1.39 gap is **not** the sink — it's a genuine op discrepancy, and testing PROD
-  against `REF_noncausal(134/6)` vs `REF_causal(127/0)` isolates causal-vs-noncausal unambiguously.
-- Your Q2 answer is correct: if this node's `.so` is the upstream causal op (the
-  `sparse_attn_sharedkv_tiling.cpp:1365` `oriWinLeft==127 / oriWinRight==0` asserts), it computes
-  causal-127 → the **inference** SAS path on this node is also wrong. It's a **build** issue, not a
-  training-specific one. Rebuild vllm-ascend from the `dspark-dsv4` commit that adds `win_right>0`
-  (the one relaxing those two asserts).
-- Your Triton kernel matching `REF_noncausal` at fp32 (5.96e-7) is the right target and is
-  untouched by any of this.
+## Background — what I set out to verify
 
-(For the record: an earlier claim from my side that "the 1.39 is the sink" was about a *different*
-script — the speculators-repo `dspark_attn_ref_bench.py`, whose `sdpa_nosink` baseline drops the
-sink. In **your** harness the sink is constant, so the 1.39 is the op. Your framing was right.)
+The main-session user (running the trainer) pushed back, sharply and correctly: *"Is the SAS op
+right or wrong, really? Did #11196 'fix' SAS — sounds off? We tested SAS aligns with eager before,
+right?"* So I stopped asserting from memory and read the actual source.
 
-## 2. DSV4 `block_size` changed 5 → 6 today (off-by-one fix) — update README §3
+## Sources (every claim → file:line — check me, don't trust me)
 
-Your README §3 lists `block_size = 5 (config) / 7 (block7 ckpt)`. The **config value is now 6**,
-and the full train/infer picture (they differ by exactly the anchor) is:
+1. **#11196 IS the non-causal SAS PR.** `dspark_extract/pr11196.diff`:
+   ```
+   - OP_CHECK_IF(oriWinLeft_  != 127, "ori_win_left should be 127" ...)
+   + OP_CHECK_IF(oriWinLeft_  < 0,   "ori_win_left should be non-negative" ...)
+   - OP_CHECK_IF(oriWinRight_ != 0,  "ori_win_right should be 0" ...)
+   + OP_CHECK_IF(oriWinRight_ < 0,   "ori_win_right should be non-negative" ...)
+   ```
+   plus kernel `ProcessBalance`/`UpdateInnerLoopCond` changed to use `+ constInfo.oriWinRight`. So
+   #11196 relaxes the causal asserts **and** makes the kernel honor `win_right`. (⇒ "#11196
+   implemented non-causal SAS" is correct.)
 
-| side | field | value | meaning | window `win_left/win_right` | KV = window+block |
-|---|---|---|---|---|---|
-| **training** (speculators — your kernel's path) | `--block-size` / `DSV4DSparkConfig.block_size` | **6** | block WIDTH = anchor(slot 0) + γ drafts | **133 / 5** (=128+6−1, 6−1) | **134** |
-| **inference** (vllm-ascend SAS op) | `dspark_block_size` = `num_speculative_tokens` | **5** | γ = drafted-token count | **132 / 4** | 133 |
+2. **Our fork has TWO SAS ops — one patched, one not:**
+   - non-quant `csrc/attention/sparse_attn_sharedkv/op_host/sparse_attn_sharedkv_tiling.cpp:1365,1368`
+     → `oriWinLeft_ < 0` / `oriWinRight_ < 0` = **PATCHED, non-causal** ✅
+   - kv-quant `csrc/attention/kv_quant_sparse_attn_sharedkv/op_host/kv_quant_sparse_attn_sharedkv_check_feature.cpp:27,31`
+     → `oriWinLeft_ != 127` ("only support 127") / `oriWinRight_ != 0` ("only support 0", comment
+     `当前不泛化`) = **still CAUSAL-only** ❌
 
-Why it matters for the kernel:
-- **Training feeds the attention 6 query positions per block**: `[anchor, m1..m5]`. slot 0 (anchor)
-  is loss-masked, but it IS a query (output computed, then discarded) **and** a key the 5 drafts
-  attend to. So your **training kernel's block = 6, window 133/5, KV = 134** — not 5, not 7.
-- Inference generates 5 tokens with the anchor sitting as the last of the 128-token context, so the
-  SAS block = 5 → 132/4. Both describe the **same 5-draft attention** (the anchor is a visible key
-  either way), and your kernel is block-agnostic, so nothing is "broken" — but:
-  - **README §3:** config `block_size` is **6** now (was 5); the **training** block is **6**.
-  - **DSV4 training parity scenario:** run at **`BS=6`** (win 133/5), not `BS=7` (134/6 = the Qwen3
-    block7 ckpt) and not `BS=5` (that's the inference view).
-  - The fork's non-causal SAS patch must accept **`win_right ∈ {4 (infer), 5 (train)}`**, not only 6.
+3. **The draft dispatches to the NON-QUANT op, passing `win_right > 0`:**
+   `vllm_ascend/ops/dspark_attention.py:140` → `torch.ops._C_ascend.npu_sparse_attn_sharedkv`;
+   `_call_dspark_sas_block` passes `ori_win_right = block_size − 1` from `_dspark_sas_window` (:32-36).
+   ⇒ the draft uses the **patched (non-causal)** op; the causal kv-quant op is **not** on the draft path.
 
-### Provenance for the 5 ↔ 6 (so you can verify, not take my word)
-- Training `speculative_tokens = block_size − 1`: speculators `models/dflash/core.py:186-188`
-  (comment *"First block position is the anchor, not emitted during gen."*); DSpark's own forward
-  masks the anchor slot: `models/dsv4_dspark/core.py:343,397`, `models/dspark/metrics.py:88,152`.
-- Inference `n_predict = dspark_block_size` (no −1): vllm-ascend
-  `patch/platform/patch_speculative_config.py:21`; test `tests/ut/spec_decode/test_dspark_config.py:36`
-  asserts `n_predict == 5`.
-- Position assignment: `models/dflash/utils.py::get_base_indices_for_anchored_blocks` — block=6 gives
-  anchor@A + drafts@A+1..A+5, i.e. exactly the 5 positions inference generates (block=5 would give
-  A+1..A+4 = only 4 → the off-by-one bug we just fixed).
-- Cross-checked on Qwen3: upstream trains `BLOCK_SIZE=8`
-  (`examples/train/dspark_qwen3_0_6b_sharegpt_online.sh:36`) ⇔ released
-  `deepseek-ai/dspark_qwen3_4b_block7/config.json` `block_size=7` (Δ=1=anchor).
+4. **The earlier "SAS aligns with eager" test tested the REFERENCE, not the `.so`.**
+   `reference_from_repo/dspark_attn_ref_bench.py` benches eager against `_dspark_attention_reference`
+   (imported pure-torch), never calling the compiled op. So it validated the **math** (consistent with
+   the source being correct); it does **not** test the binary. Your `fused_sas_vs_reference_parity.py`
+   is the first test of the actual `.so` — hence the new 1.39.
 
-Pull `feat/dsv4-dspark` for the updated `DSV4DSparkConfig.block_size=6` (commit `5834c9b`). Full
-provenance for the whole draft (architecture, block, HS) is in
-`docs/deployment/ascend-npu-dsv4-dspark-ep-training.md` §1.5 + §10 on that branch.
+## My decision trail (the two corrections — so you don't inherit my errors)
+
+- **v1 (wrong):** "the 1.39 is the sink." — that was about the *speculators-repo*
+  `dspark_attn_ref_bench.py`, whose `sdpa_nosink` baseline drops the sink. In **your** harness the
+  sink is held constant in both refs, so that didn't apply. Retracted.
+- **v2 (overclaimed):** "your causal-127 diagnosis holds." — I hadn't yet checked (a) which op the
+  draft dispatches to, or (b) our fork's actual assert at that file:line. Retracted.
+- **v3 (this doc, source-verified):** the draft uses the non-quant op, which in our fork is already
+  `< 0` (non-causal). So the **source is correct**; whether a given `.so` is causal is a **build**
+  question, and it is **not proven** — could equally be a non-window artifact.
+
+## Conclusion + action
+
+- **SAS op (source, draft path) = non-causal = correct.** Don't refactor the op's semantics.
+- The **PROD-vs-REF 1.39 is a compiled-binary question on that node, unresolved, not proven causal.**
+  Two branches:
+  1. Node built from the wrong/upstream source (or a partial build) → rebuild vllm-ascend from the
+     `dspark-dsv4` commit whose `sparse_attn_sharedkv_tiling.cpp:1365-1369` reads `< 0`.
+  2. Non-window artifact (dtype path / cache assembly / scenario) → your diag's alt-verdict.
+- **Decisive check:** `BS=5 python diag_sas_window.py` (DSV4's block; not BS=7). And verify the
+  built source: `grep -n 'oriWinRight_' .../sparse_attn_sharedkv_tiling.cpp` — `!= 0` = you built the
+  upstream causal op; `< 0` = you built ours (non-causal).
+
+## (still valid) DSV4 `block_size` 5→6 + train/infer windows
+
+An off-by-one fix landed on `feat/dsv4-dspark` today: `DSV4DSparkConfig.block_size` **5 → 6**
+(block WIDTH incl the anchor; drafts `block_size − 1` = 5). Your README §3 (`block=5`) is now stale.
+
+| side | block | `win_left / win_right` | KV = window+block |
+|---|---|---|---|
+| **training** (speculators, your kernel's path) | **6** (anchor + 5 drafts) | **133 / 5** | 134 |
+| **inference** (vllm-ascend SAS) | **5** (γ = num_spec) | **132 / 4** | 133 |
+
+`134/6` is the Qwen3 **block7** case (`128+7−1`), not DSV4. Provenance for 5↔6: training
+`speculative_tokens = block_size − 1` (speculators `models/dflash/core.py:186-188`, comment "First
+block position is the anchor, not emitted"); inference `n_predict = dspark_block_size` no −1
+(vllm-ascend `patch/platform/patch_speculative_config.py:21`); positions
+`get_base_indices_for_anchored_blocks` (block=6 → anchor@A + drafts@A+1..A+5). Full draft provenance:
+`docs/deployment/ascend-npu-dsv4-dspark-ep-training.md` §1.5 + §10 on `feat/dsv4-dspark`.
