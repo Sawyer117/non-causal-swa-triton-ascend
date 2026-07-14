@@ -155,6 +155,15 @@ def main():
     r_nc = line("PROD vs ref_noncausal fp32", prod, ref_nc)     # intended window, exact
     r_ca = line("PROD vs ref_causal127 fp32", prod, ref_ca)     # upstream window, exact
     r_ncb = line("PROD vs ref_noncausal bf16", prod, ref_nc_bf16)  # intended window at op's bf16 prec
+
+    # Per-block-position error breakdown. Block token i (0-indexed) needs its FUTURE block tokens
+    # i+1..BS-1 (via win_right). If the op's non-causal (win_right) path is broken, the error is
+    # CONCENTRATED at the early positions (many future tokens missed) and ~0 at the last (none needed).
+    nblk = prod.shape[0] // BS
+    d = (prod.float() - ref_nc.float()).abs().view(nblk, BS, *prod.shape[1:])
+    per_pos = d.mean(dim=tuple(range(2, d.dim()))).mean(dim=0)   # [BS] mean|err| per within-block pos
+    print("    per-block-position mean|PROD-ref_nc| (pos 0 sees the MOST future block tokens):")
+    print("      " + "  ".join(f"p{i}={per_pos[i].item():.2e}" for i in range(BS)))
     print()
 
     d_nc, d_ca, d_ncb = r_nc["maxAbs"], r_ca["maxAbs"], r_ncb["maxAbs"]

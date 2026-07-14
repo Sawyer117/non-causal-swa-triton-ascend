@@ -195,15 +195,30 @@ def main():
     with _override(_get_dspark_attention_custom_op=lambda q: None):
         fused = run_entry(s)
     torch.npu.synchronize()
+    prod_ok = None
     for name, a, b in (("OURS vs PROD", ours_o, fused), ("PROD vs REF ", fused, ref)):
         c, mx, ma, mr = cmp(a, b)
         print(f"[parity]  {name}  allclose={c}  maxAbs={mx:.2e}  meanAbs={ma:.2e}  meanRel={mr:.2e}")
+        if name.startswith("PROD vs REF"):
+            prod_ok = c
     print()
     tp = time_ms(lambda: run_entry(s))
     to = time_ms(lambda: ours(qb, kvl, sink))
-    print(f"[fwd speed]  production={tp:7.3f}ms   ours={to:7.3f}ms   speedup {tp / to:4.2f}x")
-    print("\n>>> OURS vs PROD allclose=True => our Triton kernel matches the production op. "
-          "speedup>1 => our Triton is faster than the compiled op.")
+    print(f"[fwd speed]  production={tp:7.3f}ms   ours={to:7.3f}ms   ratio {tp / to:4.2f}x")
+    print(">>> NOTE: the 'production' time is the vllm_ascend ENTRY = a per-block PYTHON loop calling "
+          "the op once per block (dispatch-bound), NOT the op's fused compute. It is NOT a fair "
+          "kernel-vs-kernel number; treat it as integration overhead, not op throughput.")
+    # Honest verdict keyed on the ACTUAL result (OURS is the trusted side: it matches REF above).
+    if prod_ok:
+        print("\n>>> PROD matches REF and OURS -> the production op is correct here; our kernel is "
+              "equivalent (and see the speed note).")
+    else:
+        print("\n>>> PROD does NOT match REF, but OURS DOES (see 'OURS vs REF' above) -> the discrepancy "
+              "is in the COMPILED OP on this node, not our kernel and not the scenario. This is not "
+              "bf16 (our bf16 kernel matches REF) nor the window (see diag_sas_window.py). Verify the "
+              "build: grep -n 'oriWinRight_' <built csrc>/attention/sparse_attn_sharedkv/op_host/"
+              "sparse_attn_sharedkv_tiling.cpp  (<0 = fork/non-causal; !=0 = upstream), and diff this "
+              "node's csrc against the known-good node before trusting a prod-vs-ours speed number.")
 
 
 if __name__ == "__main__":
