@@ -88,7 +88,9 @@ RTOL = float(os.environ.get("RTOL", "2e-2"))
 H = int(os.environ.get("H", "64"))       # heads
 D = int(os.environ.get("D", "512"))      # head_dim
 WIN = int(os.environ.get("WIN", "128"))  # sliding_window
-BS = int(os.environ.get("BS", "7"))      # block_size (block7 ckpt)
+BS = int(os.environ.get("BS", "7"))      # 7=Qwen3-block7 ckpt; DSV4: infer block=5 (win 132/4),
+#                                          train block=6 (win 133/5) — see README §3. Diagnosis is
+#                                          BS-agnostic (causal-vs-noncausal); override with BS=5/6.
 NBLK = int(os.environ.get("NBLK", "8"))  # draft blocks (one request slot each)
 SCALE = D ** -0.5
 CAP = 1 << (max(WIN + BS, 1) - 1).bit_length()  # cache capacity, next pow2 >= win+block

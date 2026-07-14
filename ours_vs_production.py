@@ -74,7 +74,9 @@ DT = {"bfloat16": torch.bfloat16, "float32": torch.float32}.get(os.environ.get("
 ATOL = float(os.environ.get("ATOL", "2e-2"))
 RTOL = float(os.environ.get("RTOL", "2e-2"))
 H = int(os.environ.get("H", "64")); D = int(os.environ.get("D", "512"))
-WIN = int(os.environ.get("WIN", "128")); BS = int(os.environ.get("BS", "7"))
+WIN = int(os.environ.get("WIN", "128")); BS = int(os.environ.get("BS", "7"))  # 7=Qwen3-block7 ckpt;
+# DSV4 real: inference block=5 (win 132/4), training block=6 (win 133/5) — see README §3. The
+# production SAS op is the INFERENCE path, so BS=5 is the faithful prod-comparison value.
 NBLK = int(os.environ.get("NBLK", "64"))
 KV = WIN + BS
 SCALE = D ** -0.5

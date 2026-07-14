@@ -8,8 +8,10 @@ at the REAL DSpark block shapes, against:
   * GOLD  : vllm_ascend `_dspark_attention_reference` (per draft block) — the parity target.
   * eager : batched einsum+sink (the fast pure-torch fallback) — the speed/memory baseline.
 
-Real shapes (HF config.json): H=64, D=512, num_kv_heads=1 (MLA), window=128, block_size=7,
-so KV = window + block = 135; each draft block's KV is [window context | the block] (dense).
+Real shapes (HF config.json): H=64, D=512, num_kv_heads=1 (MLA), window=128. DSV4 TRAINING block
+= 6 (anchor slot0 + 5 drafts; win 133/5), so KV = window + block = 134; each draft block's KV is
+[window context | the block] (dense). (BS=5 is the inference view; BS=7 = the Qwen3-block7 ckpt.)
+Kernel is block-agnostic — override with BS=<n>. Default is the DSV4 training geometry (BS=6).
 
 READING: bf16 diff ~1e-2 vs the fp32 gold is expected rounding; DTYPE=float32 -> ~1e-6 (proves
 it's dtype, not a math bug). The op's grid is core-capped (grid <= cube cores) — correct on the
@@ -61,7 +63,7 @@ DT = {"bfloat16": torch.bfloat16, "float32": torch.float32}.get(
 ATOL = float(os.environ.get("ATOL", "2e-2"))
 RTOL = float(os.environ.get("RTOL", "2e-2"))
 NBLK = int(os.environ.get("NBLK", "64"))
-BS = int(os.environ.get("BS", "7"))
+BS = int(os.environ.get("BS", "6"))   # DSV4 training block = anchor + 5 drafts (win 133/5, KV=134)
 WIN = int(os.environ.get("WIN", "128"))
 H = int(os.environ.get("H", "64"))
 D = int(os.environ.get("D", "512"))

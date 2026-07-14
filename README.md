@@ -93,7 +93,8 @@ branch `feat/dsv4-dspark`). Put these in the tests — don't use toy sizes as th
 | `D` head_dim  | **512**  | per-head q/k/v width (`nope | rope`)                          |
 | `rope_head_dim` | **64** | trailing slice of `D` that is rotated (**partial** RoPE)     |
 | `window`      | **128**  | sliding-window context tokens                                |
-| `block_size` (γ) | **5** (config) / **7** (block7 ckpt) | draft tokens per forward |
+| `block_size`  | **6** (DSV4 config) | draft-**block width** = anchor(slot 0) + γ drafts. **≠ γ.** Train 6 / infer 5 / Qwen3-block7 ckpt 7 — see note ↓ |
+| `γ` = `num_speculative_tokens` | **5** | drafted tokens per block (`block_size − 1`, anchor excluded) |
 | `hidden_size` | **4096** | model dim (for the projections, not the attention core)      |
 | `vocab_size`  | **129280** | (`noise_token_id=128799`)                                  |
 | `scale`       | **D**⁻⁰·⁵ = 512⁻⁰·⁵ | softmax scale                                    |
@@ -107,8 +108,23 @@ k,v  : [N, KV,         H, D]           # KV = window + block_size  (real K/V is 
 sink : [H]                             # per-head, fp32
 o    : [N, block_size, H, D]
 ```
-Real magnitudes: `H=64, D=512, window=128, block_size∈{5,7}` → `KV = 133 or 135`.
+Real magnitudes: `H=64, D=512, window=128`.
 `N` scales with sequence/anchors (the bench scans `NBLK=64 … 512`).
+
+> **`block_size` is 6 now (was 5 — off-by-one fix, `feat/dsv4-dspark` commit `5834c9b`, 2026-07-14).**
+> Training and inference describe the *same 5-draft attention* but count the block differently — they
+> differ by exactly the **anchor** (slot 0: loss-masked, but it IS a query whose output is computed
+> then discarded, AND a key the 5 drafts attend to). The kernel is **block-agnostic**, so nothing in
+> the kernel changes — but validate at the right geometry:
+>
+> | context | `block_size` | queries/block | `win_left / win_right` | `KV = window+block` |
+> |---|---|---|---|---|
+> | **training** (our kernel's path; speculators `DSV4DSparkConfig.block_size`) | **6** | `[anchor, m1..m5]` | **133 / 5** | **134** |
+> | **inference** (vllm-ascend SAS op; `dspark_block_size = num_speculative_tokens`) | **5** | `m1..m5` (anchor folded into the 128-ctx) | **132 / 4** | 133 |
+> | Qwen3 **block7** released ckpt (a *different* model) | 7 | 7 | 134 / 6 | 135 |
+>
+> **DSV4 training parity → run `BS=6` (win 133/5).** `BS=7` is the Qwen3 ckpt; `BS=5` is the inference
+> view. A fork fixing the SAS op must accept `win_right ∈ {4 (infer), 5 (train)}`, not only 6.
 
 **Layouts** (same math): **MLA-shared** (real, `num_kv_heads=1`) vs **MHA** (K/V expanded
 per-head — a conservative memory over-estimate the bench uses). Do MHA first if simpler;
@@ -134,8 +150,8 @@ this is a sliding-window attention with an **asymmetric** window + sink:
 
 ```
 keep[i,j] = (j >= i - win_left) & (j <= i + win_right)
-win_left  = window + block_size - 1        # e.g. 128 + 7 - 1 = 134
-win_right = block_size - 1                 # e.g. 7 - 1 = 6
+win_left  = window + block_size - 1        # DSV4 training: 128 + 6 - 1 = 133  (block7 ckpt: 134)
+win_right = block_size - 1                 # DSV4 training: 6 - 1 = 5          (block7 ckpt: 6)
 ```
 
 ⚠️ **Do not use the naive symmetric `window-1`.** vLLM-Ascend ships a test that rejects it;
