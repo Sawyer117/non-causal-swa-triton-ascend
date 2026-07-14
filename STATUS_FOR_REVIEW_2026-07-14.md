@@ -173,3 +173,39 @@ the inference-faithful value.
 3. `diff -r` this node's `csrc/attention/sparse_attn_sharedkv` against the known-good inference node.
 
 Our kernel requires no changes in any branch of the above.
+
+## 8. UPDATE — likely mechanism found: a STALE op_kernel (missing PR #11196's clamp)
+
+Read the actual PR #11196 diff (`/workspace/dspark_extract/pr11196.diff`). win_right support is spread
+across **three separately-compiled** units, and the failure signature points at one being stale:
+
+1. `sparse_attn_sharedkv/op_host/..._tiling.cpp:1365,1368` — relax the gate `!=127/!=0` → `<0`.
+   The node's op HAS this (it accepted `win_right=4` without RuntimeError→fallback; PROD≠REF≠0).
+2. `sparse_attn_sharedkv/op_kernel/arch32/sparse_attn_sharedkv_swa_kernel.h:692` — **the critical fix**:
+   `oriMaskRight = Min(oriMaskRight, actOriS2Size − 1);`. The pre-existing line
+   `oriMaskRight = actOriS2Size − actS1Size + s1EndIdx + oriWinRight` was ALREADY there (it's a diff
+   context line), so **without the new clamp, `oriMaskRight` overshoots the KV length** (win_right=4,
+   KV=133 → right edge ≈ 136 > 132 → the kernel iterates keys that don't exist → reads adjacent
+   memory / garbage). Verified: fork (va-src) has the clamp at :692; upstream (.refsrc) does not.
+3. `sparse_attn_sharedkv_metadata/op_kernel_aicpu/..._aicpu.cpp` — `nextToken_ = winRight_` (the mask
+   right-bound in the AICPU metadata). Fresh here (PROD is non-causal-ish, so it DOES see future
+   tokens), which is why PROD is closer to non-causal than causal.
+
+**Coherent story:** metadata fresh (attends to the real future block tokens → non-causal-ish ✓) +
+op_kernel stale (no clamp → also reads garbage past the KV end → wrong, precision-independent, worse
+on later query rows ✓). That matches every observation: PROD≠REF by 1.05 maxAbs / 1.6e-2 meanAbs,
+closer to non-causal, unchanged by fp16 vs bf16.
+
+**CANN version is NOT the cause:** the branch requires `CANN == 9.0.0` (va-src/README.md:65) and the
+node has `9.0.0.0430`. A too-low CANN fails to BUILD or fails at dispatch (cf. the fp32
+`AclNN_Parameter_Error`), it does not silently miscompute. Don't chase CANN version.
+
+**Decisive checks / fix for the node owner:**
+- Grep the node's BUILD SOURCE for the clamp:
+  `grep -n 'Min(tempLoopInfo.oriMaskRight' /home/a00652497/dspark_austin/installation/vllm-ascend-v4/csrc/attention/sparse_attn_sharedkv/op_kernel/arch32/sparse_attn_sharedkv_swa_kernel.h`
+  → present = source is fine, the built `.o` is STALE (incremental build didn't recompile the kernel);
+    absent = a pre-#11196 kernel was checked out.
+- FULL clean rebuild so op_kernel + AICPU metadata recompile (not just op_host):
+  `rm -rf build csrc/build` and clear the installed custom-opp package for these two ops, then rebuild.
+- `BS=5 python diag_sas_window.py` per-block-position breakdown (`6de0081`): garbage-overshoot from the
+  missing clamp should make the error uneven across p0..p4.
