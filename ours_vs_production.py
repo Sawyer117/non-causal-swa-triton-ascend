@@ -40,6 +40,34 @@ try:
 except Exception as e:  # noqa: BLE001
     raise SystemExit(f"!! cannot import our Triton kernel: {e}")
 
+
+def _ensure_sas_op():
+    """editable vllm-ascend installs don't always auto-load the compiled `vllm_ascend_C.so`, so the
+    SAS op isn't registered even though it's BUILT (torch.ops.load_library(so) fixes it). Load it
+    explicitly if `torch.ops._C_ascend.npu_sparse_attn_sharedkv` is missing."""
+    try:
+        torch.ops._C_ascend.npu_sparse_attn_sharedkv          # already registered?
+        return True
+    except (AttributeError, RuntimeError):
+        pass
+    import glob
+    import vllm_ascend
+    d = os.path.dirname(vllm_ascend.__file__)
+    for so in sorted(glob.glob(os.path.join(d, "vllm_ascend_C*.so"))):
+        try:
+            torch.ops.load_library(so)
+            print(f">>> loaded vllm_ascend C-ext (editable install didn't auto-load it): {so}")
+        except Exception as e:  # noqa: BLE001
+            print(f">>> could not load {so}: {type(e).__name__}: {e}")
+    try:
+        torch.ops._C_ascend.npu_sparse_attn_sharedkv
+        return True
+    except (AttributeError, RuntimeError):
+        return False
+
+
+_ensure_sas_op()
+
 torch.manual_seed(0)
 DT = {"bfloat16": torch.bfloat16, "float32": torch.float32}.get(os.environ.get("DTYPE", "bfloat16"),
                                                                 torch.bfloat16)
