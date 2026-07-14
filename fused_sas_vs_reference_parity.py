@@ -191,11 +191,23 @@ def main():
         ref = _run(s)
     torch.npu.synchronize()
 
+    # FALSE-PASS GUARD: the SAS op has NO fp32 kernel (supports fp16/bf16 only). With DTYPE=float32 it
+    # raises AclNN_Parameter_Error -> _maybe_call_dspark_sas_attention catches it and FALLS BACK to the
+    # torch reference, so FUSED becomes bit-identical to REF and prints a meaningless 0.0. Detect that.
+    if torch.equal(fused, ref):
+        print("\n!! FUSED is BIT-IDENTICAL to REF -> the SAS op did NOT run; it fell back to the torch "
+              "reference (see the 'DSpark SAS attention failed' warning above). Almost always because "
+              "DTYPE=float32 is unsupported (op kernels are fp16/bf16 only). This 0.0 is meaningless.\n"
+              "   Use the op's TIGHTEST supported dtype instead:  DTYPE=float16 (10-bit, 8x tighter "
+              "than bf16) — that's the clean op-correctness test.")
+        raise SystemExit(2)
+
     r = compare(fused, ref)
     print(f"\n[fused vs ref]  allclose={r['allclose']}  "
           f"maxAbs={r['maxAbs']:.2e}  meanAbs={r['meanAbs']:.2e}  meanRel={r['meanRel']:.2e}")
-    print(">>> bf16: ~1e-2 is expected rounding; run DTYPE=float32 -> should collapse to ~1e-6.")
-    print(">>> to validate a Triton kernel: replace the FUSED run with your kernel, keep REF.")
+    print(">>> bf16 ~1e-2 is expected rounding. The op has NO fp32 kernel -> use DTYPE=float16 (8x "
+          "tighter) for the clean test; float32 falls back to the reference (a false 0.0).")
+    print(">>> if maxAbs stays high at fp16, run diag_sas_window.py to check causal-vs-noncausal.")
     raise SystemExit(0 if r["allclose"] else 1)
 
 

@@ -69,8 +69,9 @@ def _ensure_sas_op():
 _ensure_sas_op()
 
 torch.manual_seed(0)
-DT = {"bfloat16": torch.bfloat16, "float32": torch.float32}.get(os.environ.get("DTYPE", "bfloat16"),
-                                                                torch.bfloat16)
+DT = {"bfloat16": torch.bfloat16, "float16": torch.float16, "float32": torch.float32}.get(
+    os.environ.get("DTYPE", "bfloat16"), torch.bfloat16)  # NOTE: SAS op has NO fp32 kernel (fp16/bf16
+# only) -> DTYPE=float32 makes it fall back to the torch ref (false 0.0). Use float16 for the clean test.
 ATOL = float(os.environ.get("ATOL", "2e-2"))
 RTOL = float(os.environ.get("RTOL", "2e-2"))
 H = int(os.environ.get("H", "64")); D = int(os.environ.get("D", "512"))
