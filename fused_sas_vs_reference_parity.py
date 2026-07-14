@@ -60,6 +60,25 @@ except Exception as e:  # noqa: BLE001
         "   run on a node with vllm_ascend installed (the A3), env dspark-dsv4-base."
     )
 
+
+def _ensure_sas_op():
+    """editable vllm-ascend installs don't always auto-load the compiled vllm_ascend_C.so, so the SAS
+    op isn't registered even though it's built. Load it explicitly if missing."""
+    try:
+        torch.ops._C_ascend.npu_sparse_attn_sharedkv; return
+    except (AttributeError, RuntimeError):
+        pass
+    import glob
+    import vllm_ascend
+    for so in sorted(glob.glob(os.path.join(os.path.dirname(vllm_ascend.__file__), "vllm_ascend_C*.so"))):
+        try:
+            torch.ops.load_library(so); print(f">>> loaded vllm_ascend C-ext: {so}")
+        except Exception as e:  # noqa: BLE001
+            print(f">>> could not load {so}: {type(e).__name__}: {e}")
+
+
+_ensure_sas_op()
+
 torch.manual_seed(0)
 DT = {"bfloat16": torch.bfloat16, "float16": torch.float16, "float32": torch.float32}.get(
     os.environ.get("DTYPE", "bfloat16"), torch.bfloat16)
