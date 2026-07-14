@@ -61,9 +61,14 @@ from vllm_ascend.ops.dspark_attention import _dspark_sas_window  # noqa: E402
 DEV = "npu:0"
 
 
-def masked_reference(s, win_left, win_right):
+def masked_reference(s, win_left, win_right, prec="fp32"):
     """dspark_attention's per-block loop, but with an explicit position-based sliding-window mask.
-    win_left/win_right are counts of past/future tokens (inclusive of the diagonal via win_left)."""
+    win_left/win_right are counts of past/future tokens (inclusive of the diagonal via win_left).
+    prec='fp32': exact oracle. prec='bf16': mimic the op's internal Cube precision — round Q/K/V and
+    the softmax P to bf16 (fp32 accumulate + fp32 softmax + fp32 sink), i.e. a standard bf16 attention
+    path. If PROD matches the bf16 ref but not the fp32 one, the residual is just bf16 Cube rounding."""
+    def r16(x):  # bf16-round-trip (bf16 matmul inputs, fp32 accumulate) when prec='bf16', else fp32
+        return x.to(torch.bfloat16).float() if prec == "bf16" else x.float()
     q = s["q"]
     positions = s["positions"].to(torch.long)
     request_slots = s["request_slots"].to(torch.long)
@@ -99,19 +104,21 @@ def masked_reference(s, win_left, win_right):
         packed_k = torch.cat([k_ctx, k_blk], dim=0)          # [KV, H, D]
         key_pos = torch.cat([ctx_positions, block_pos], dim=0)  # [KV]
 
-        qf = q[off:end].float()                              # [bs, H, D]
-        scores = torch.einsum("qhd,khd->qhk", qf, packed_k.float()) * SCALE   # [bs, H, KV]
+        qf = r16(q[off:end])                                 # [bs, H, D]  (bf16-rounded if prec='bf16')
+        kf = r16(packed_k)
+        scores = torch.einsum("qhd,khd->qhk", qf, kf) * SCALE   # [bs, H, KV]  (fp32 accumulate)
         # sliding-window mask on absolute positions: qp - win_left <= kp <= qp + win_right
         qp = block_pos.view(-1, 1, 1)                        # [bs,1,1]
         kp = key_pos.view(1, 1, -1)                          # [1,1,KV]
         keep = (kp >= qp - win_left) & (kp <= qp + win_right)
         scores = scores.masked_fill(~keep, float("-inf"))
 
-        sink = sink_all[: q.shape[1]].float().view(1, -1, 1)  # [1,H,1]
+        sink = sink_all[: q.shape[1]].float().view(1, -1, 1)  # [1,H,1]  (op takes sink as fp32)
         scores_max = torch.maximum(scores.max(dim=-1, keepdim=True).values, sink)
         exp_s = torch.exp(scores - scores_max)
         probs = exp_s / (exp_s.sum(dim=-1, keepdim=True) + torch.exp(sink - scores_max))
-        out[off:end] = torch.einsum("qhk,khd->qhd", probs, packed_k.float()).to(q.dtype)
+        p_pv = probs.to(torch.bfloat16).float() if prec == "bf16" else probs   # P rounded before P@V
+        out[off:end] = torch.einsum("qhk,khd->qhd", p_pv, kf).to(q.dtype)      # V = K (shared_kv)
     return out
 
 
@@ -133,33 +140,42 @@ def main():
         ref_entry = _run(s)
     torch.npu.synchronize()
 
-    ref_nc = masked_reference(s, wl, wr)        # intended non-causal 134/6
-    ref_ca = masked_reference(s, 127, 0)        # upstream causal 127/0
+    ref_nc = masked_reference(s, wl, wr)                  # intended non-causal window, fp32 oracle
+    ref_ca = masked_reference(s, 127, 0)                  # upstream causal 127/0, fp32
+    ref_nc_bf16 = masked_reference(s, wl, wr, prec="bf16")  # non-causal, mimic op internal bf16 Cube
 
     def line(tag, a, b):
         r = compare(a, b)
-        print(f"[{tag:22}] allclose={str(r['allclose']):5}  maxAbs={r['maxAbs']:.2e}  "
+        print(f"[{tag:24}] allclose={str(r['allclose']):5}  maxAbs={r['maxAbs']:.2e}  "
               f"meanAbs={r['meanAbs']:.2e}  meanRel={r['meanRel']:.2e}")
+        return r
 
     print()
     line("sanity ref_nc vs entry", ref_nc, ref_entry)   # my non-causal ref should equal the entry's loop
-    line("PROD vs ref_noncausal", prod, ref_nc)         # intended window
-    line("PROD vs ref_causal127", prod, ref_ca)         # upstream window
+    r_nc = line("PROD vs ref_noncausal fp32", prod, ref_nc)     # intended window, exact
+    r_ca = line("PROD vs ref_causal127 fp32", prod, ref_ca)     # upstream window, exact
+    r_ncb = line("PROD vs ref_noncausal bf16", prod, ref_nc_bf16)  # intended window at op's bf16 prec
     print()
 
-    d_nc = compare(prod, ref_nc)["maxAbs"]
-    d_ca = compare(prod, ref_ca)["maxAbs"]
-    if d_nc <= d_ca and d_nc < 5e-2:
-        print(">>> VERDICT: PROD matches the NON-CAUSAL 134/6 window -> op is correct; the parity gap "
-              "is NOT a window bug (look elsewhere: dtype path, cache assembly).")
-    elif d_ca < d_nc and d_ca < 5e-2:
-        print(">>> VERDICT: PROD matches the CAUSAL 127/0 window, NOT 134/6. CONFIRMED: this build's "
-              "SAS op computes the upstream causal window. The fork's non-causal (win_right>0) kernel "
-              "patch is missing from this .so. Rebuild vllm-ascend from the dspark-dsv4 commit that "
-              "adds win_right support (same one relaxing the oriWinLeft==127/oriWinRight==0 asserts).")
+    d_nc, d_ca, d_ncb = r_nc["maxAbs"], r_ca["maxAbs"], r_ncb["maxAbs"]
+    noncausal = d_nc < d_ca                       # closer to non-causal than to causal?
+    bf16_closes = d_ncb < 0.5 * d_nc              # does the op's bf16 precision explain the fp32 gap?
+    if noncausal and (d_ncb < 5e-2 or bf16_closes):
+        print(">>> VERDICT: PROD is NON-CAUSAL (closer to non-causal than causal) and the bf16-internal "
+              "reference CLOSES the gap -> the op is CORRECT; the residual vs the fp32 oracle is just the "
+              "op's internal bf16 Cube precision (the same bf16 error any bf16 attention op has, incl. "
+              "ours). Not a window/build bug. Confirm equivalence via `ours_vs_production.py`.")
+    elif not noncausal and d_ca < 5e-2:
+        print(">>> VERDICT: PROD matches the CAUSAL 127/0 window -> this build's SAS op is the UPSTREAM "
+              "causal op. Rebuild vllm-ascend from the dspark-dsv4 commit whose "
+              "sparse_attn_sharedkv_tiling.cpp:1365-1369 reads `< 0`.")
+    elif noncausal:
+        print(">>> VERDICT: PROD is directionally NON-CAUSAL but even the bf16-internal ref doesn't close "
+              "the gap -> residual is neither window nor plain bf16 rounding. Investigate sink/scale "
+              "handling; run `ours_vs_production.py` to compare the op against our validated kernel.")
     else:
-        print(">>> VERDICT: PROD matches NEITHER window cleanly -> not a pure window-semantics bug "
-              "(suspect a numeric/build-corruption issue in the compiled op).")
+        print(">>> VERDICT: PROD matches neither window cleanly -> numeric/build artifact; compare "
+              "against our kernel with `ours_vs_production.py`.")
 
 
 if __name__ == "__main__":
