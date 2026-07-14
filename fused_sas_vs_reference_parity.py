@@ -103,7 +103,12 @@ def build_scenario():
     base = WIN                       # block starts at position WIN -> context = [0, WIN-1]
     n = NBLK * BS
     q = torch.randn(n, H, D, device=DEV, dtype=DT)
-    draft_k = torch.randn(n, H, D, device=DEV, dtype=DT)   # shared_kv: v derived from k
+    # MLA (num_kv_heads=1): the KV latent is SHARED across all H query heads. Generate ONE head and
+    # broadcast. (Bug fixed 2026-07-14: this used to be randn(n,H,D) — per-head-INDEPENDENT K. With
+    # shared_kv=True the SAS op only reads head 0 [dspark_attention.py:246 `k_ctx[:, :1, :]`] while
+    # the reference uses each head's own K, so per-head K made REF!=FUSED by construction — maxAbs
+    # ~1.39 that had NOTHING to do with the op. Real inference shares the latent, hence good AL.)
+    draft_k = torch.randn(n, 1, D, device=DEV, dtype=DT).expand(n, H, D).contiguous()
     attn_sink = torch.randn(H, device=DEV, dtype=DT)
 
     positions = torch.empty(n, dtype=torch.int32, device=DEV)
@@ -118,7 +123,7 @@ def build_scenario():
         sl = slice(b * BS, (b + 1) * BS)
         positions[sl] = torch.arange(base, base + BS, dtype=torch.int32, device=DEV)
         request_slots[sl] = b
-        cache_k[b, idx] = torch.randn(WIN, H, D, device=DEV, dtype=DT)
+        cache_k[b, idx] = torch.randn(WIN, 1, D, device=DEV, dtype=DT).expand(WIN, H, D)  # shared latent
         cache_positions[b, idx] = ctx_pos.to(torch.int32)
         cache_valid[b, idx] = True
     # shared_kv=True => the entry uses k as v; pass k for the v args to satisfy the API.
