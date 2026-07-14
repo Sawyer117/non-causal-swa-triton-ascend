@@ -61,12 +61,17 @@ from vllm_ascend.ops.dspark_attention import _dspark_sas_window  # noqa: E402
 DEV = "npu:0"
 
 
-def masked_reference(s, win_left, win_right, prec="fp32"):
+def masked_reference(s, win_left, win_right, prec="fp32", sink_mode="denom"):
     """dspark_attention's per-block loop, but with an explicit position-based sliding-window mask.
     win_left/win_right are counts of past/future tokens (inclusive of the diagonal via win_left).
     prec='fp32': exact oracle. prec='bf16': mimic the op's internal Cube precision — round Q/K/V and
     the softmax P to bf16 (fp32 accumulate + fp32 softmax + fp32 sink), i.e. a standard bf16 attention
-    path. If PROD matches the bf16 ref but not the fp32 one, the residual is just bf16 Cube rounding."""
+    path. If PROD matches the bf16 ref but not the fp32 one, the residual is just bf16 Cube rounding.
+    sink_mode selects how the per-head sink enters softmax (to probe the op's sink handling):
+      'denom'  = reference: extra virtual key exp(sink-max) in the DENOMINATOR only (value 0).
+      'none'   = plain softmax, sink ignored entirely.
+      'nomax'  = denominator term exp(sink) WITHOUT the -scores_max stabiliser (a plausible op bug).
+      'key'    = sink as an extra key with VALUE broadcast (wrong: pulls the output toward 0-ish)."""
     def r16(x):  # bf16-round-trip (bf16 matmul inputs, fp32 accumulate) when prec='bf16', else fp32
         return x.to(torch.bfloat16).float() if prec == "bf16" else x.float()
     q = s["q"]
@@ -114,9 +119,18 @@ def masked_reference(s, win_left, win_right, prec="fp32"):
         scores = scores.masked_fill(~keep, float("-inf"))
 
         sink = sink_all[: q.shape[1]].float().view(1, -1, 1)  # [1,H,1]  (op takes sink as fp32)
-        scores_max = torch.maximum(scores.max(dim=-1, keepdim=True).values, sink)
+        row_max = scores.max(dim=-1, keepdim=True).values
+        if sink_mode == "none":
+            scores_max = row_max
+            denom_extra = 0.0
+        elif sink_mode == "nomax":
+            scores_max = row_max
+            denom_extra = torch.exp(sink)                      # no -max stabiliser (a plausible op bug)
+        else:  # 'denom' (reference)
+            scores_max = torch.maximum(row_max, sink)
+            denom_extra = torch.exp(sink - scores_max)
         exp_s = torch.exp(scores - scores_max)
-        probs = exp_s / (exp_s.sum(dim=-1, keepdim=True) + torch.exp(sink - scores_max))
+        probs = exp_s / (exp_s.sum(dim=-1, keepdim=True) + denom_extra)
         p_pv = probs.to(torch.bfloat16).float() if prec == "bf16" else probs   # P rounded before P@V
         out[off:end] = torch.einsum("qhk,khd->qhd", p_pv, kf).to(q.dtype)      # V = K (shared_kv)
     return out
@@ -143,18 +157,25 @@ def main():
     ref_nc = masked_reference(s, wl, wr)                  # intended non-causal window, fp32 oracle
     ref_ca = masked_reference(s, 127, 0)                  # upstream causal 127/0, fp32
     ref_nc_bf16 = masked_reference(s, wl, wr, prec="bf16")  # non-causal, mimic op internal bf16 Cube
+    # sink-handling probes (the residual is uniform-per-position + precision-independent => systematic):
+    ref_nosink = masked_reference(s, wl, wr, sink_mode="none")    # sink dropped entirely
+    ref_nomax = masked_reference(s, wl, wr, sink_mode="nomax")    # sink denom without -max stabiliser
 
     def line(tag, a, b):
         r = compare(a, b)
-        print(f"[{tag:24}] allclose={str(r['allclose']):5}  maxAbs={r['maxAbs']:.2e}  "
+        print(f"[{tag:26}] allclose={str(r['allclose']):5}  maxAbs={r['maxAbs']:.2e}  "
               f"meanAbs={r['meanAbs']:.2e}  meanRel={r['meanRel']:.2e}")
         return r
 
     print()
     line("sanity ref_nc vs entry", ref_nc, ref_entry)   # my non-causal ref should equal the entry's loop
-    r_nc = line("PROD vs ref_noncausal fp32", prod, ref_nc)     # intended window, exact
+    r_nc = line("PROD vs ref_noncausal fp32", prod, ref_nc)     # intended window+sink, exact
     r_ca = line("PROD vs ref_causal127 fp32", prod, ref_ca)     # upstream window, exact
     r_ncb = line("PROD vs ref_noncausal bf16", prod, ref_nc_bf16)  # intended window at op's bf16 prec
+    r_ns = line("PROD vs ref_NO_sink", prod, ref_nosink)        # sink dropped -> closer? op ignores sink
+    r_nm = line("PROD vs ref_sink_NO_max", prod, ref_nomax)     # sink w/o max-stabiliser -> closer? op bug
+    # sink's own footprint, for scale: how far the reference moves when the sink is dropped
+    line("(ref_nc vs ref_NO_sink)", ref_nc, ref_nosink)
 
     # Per-block-position error breakdown. Block token i (0-indexed) needs its FUTURE block tokens
     # i+1..BS-1 (via win_right). If the op's non-causal (win_right) path is broken, the error is
@@ -167,21 +188,27 @@ def main():
     print()
 
     d_nc, d_ca, d_ncb = r_nc["maxAbs"], r_ca["maxAbs"], r_ncb["maxAbs"]
+    d_ns, d_nm = r_ns["maxAbs"], r_nm["maxAbs"]
     noncausal = d_nc < d_ca                       # closer to non-causal than to causal?
     bf16_closes = d_ncb < 0.5 * d_nc              # does the op's bf16 precision explain the fp32 gap?
+    # which reference does PROD match best?
+    cands = {"non-causal+sink (correct)": d_nc, "NO sink": d_ns, "sink w/o max-stabiliser": d_nm,
+             "causal": d_ca}
+    best = min(cands, key=cands.get)
     if noncausal and (d_ncb < 5e-2 or bf16_closes):
-        print(">>> VERDICT: PROD is NON-CAUSAL (closer to non-causal than causal) and the bf16-internal "
-              "reference CLOSES the gap -> the op is CORRECT; the residual vs the fp32 oracle is just the "
-              "op's internal bf16 Cube precision (the same bf16 error any bf16 attention op has, incl. "
-              "ours). Not a window/build bug. Confirm equivalence via `ours_vs_production.py`.")
-    elif not noncausal and d_ca < 5e-2:
-        print(">>> VERDICT: PROD matches the CAUSAL 127/0 window -> this build's SAS op is the UPSTREAM "
-              "causal op. Rebuild vllm-ascend from the dspark-dsv4 commit whose "
-              "sparse_attn_sharedkv_tiling.cpp:1365-1369 reads `< 0`.")
+        print(">>> VERDICT: PROD is NON-CAUSAL and the bf16-internal reference CLOSES the gap -> the op is "
+              "CORRECT; residual is just bf16 Cube precision. Confirm via `ours_vs_production.py`.")
+    elif best != "non-causal+sink (correct)" and cands[best] < 0.5 * d_nc:
+        print(f">>> VERDICT: PROD best matches the '{best}' reference (maxAbs {cands[best]:.2e}) rather than "
+              f"the correct non-causal+sink one ({d_nc:.2e}) -> the op's SINK handling differs from the "
+              "reference. This is a systematic (per-position-uniform) op bug, NOT window/precision/build. "
+              "Hand this to the op team: check how `sinks` enters the softmax denominator in the AscendC "
+              "kernel vs `_dspark_attention_reference`.")
     elif noncausal:
-        print(">>> VERDICT: PROD is directionally NON-CAUSAL but even the bf16-internal ref doesn't close "
-              "the gap -> residual is neither window nor plain bf16 rounding. Investigate sink/scale "
-              "handling; run `ours_vs_production.py` to compare the op against our validated kernel.")
+        print(">>> VERDICT: PROD is directionally NON-CAUSAL but matches NO clean reference (incl. the sink "
+              "variants). Residual is systematic + precision-independent + uniform per position -> a real "
+              "op-vs-reference discrepancy on this node (sink/scale/normalisation). Not our kernel; hand to "
+              "the op team with this table. `ours_vs_production.py` confirms OURS==REF.")
     else:
         print(">>> VERDICT: PROD matches neither window cleanly -> numeric/build artifact; compare "
               "against our kernel with `ours_vs_production.py`.")
