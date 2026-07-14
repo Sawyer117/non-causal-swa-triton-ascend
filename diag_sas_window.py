@@ -1,22 +1,28 @@
 #!/usr/bin/env python3
-"""DECISIVE diagnostic: does the compiled SAS op honor the non-causal 134/6 window, or does it
-silently compute the upstream CAUSAL 127/0 window?
+"""SECONDARY diagnostic: does the compiled SAS op honor the non-causal win, or was it built from the
+UPSTREAM causal-only source? RUN THIS ONLY IF the parity gap survives the harness fix (see below).
 
-WHY
----
-`fused_sas_vs_reference_parity.py` shows PROD (npu_sparse_attn_sharedkv) != REF (maxAbs~1.39) on the
-team's known-good scenario. Reading the AscendC source explains it:
+WHY / STATUS (read this first)
+------------------------------
+The original maxAbs~1.39 in `fused_sas_vs_reference_parity.py` was NOT a window bug — it was a
+HARNESS bug: build_scenario fed per-head-INDEPENDENT K into shared_kv=True (MLA num_kv_heads=1). The
+SAS op reads only head 0 (`dspark_attention.py:246` `k_ctx[:, :1, :]`) and broadcasts it to all H
+query heads, while the reference uses each head's own K -> they disagreed on H-1 of H heads by
+construction, nothing to do with the op. Fixed (parity build_scenario now shares one KV latent).
+And the fork source IS non-causal: in va-src/va_fix the non-quant op's
+`sparse_attn_sharedkv_tiling.cpp:1365,1368` reads `oriWinLeft_ < 0 / oriWinRight_ < 0` (PR #11196
+relaxed the upstream `!= 127 / != 0` AND made the kernel honor win_right). The `.refsrc`/upstream
+trees still show `!= 127` (causal) — that's a DIFFERENT tree, and the causal kv-quant op is not on
+the draft path. So the op is expected correct.
 
-  csrc/attention/sparse_attn_sharedkv/op_host/sparse_attn_sharedkv_tiling.cpp:1365
-      OP_CHECK_IF(oriWinLeft_  != 127, "ori_win_left should be 127", FAIL);
-      OP_CHECK_IF(oriWinRight_ != 0,   "ori_win_right should be 0",  FAIL);
-  op_kernel/sparse_attn_sharedkv_common.h:310  oriWinRight = 0;  (causal-only kernel)
+THIS SCRIPT is only useful for the remaining BUILD question: if, AFTER the harness fix, PROD still
+!= REF, is it because THIS NODE built the .so from the upstream (causal) source instead of the fork?
+It computes the reference under BOTH window interpretations and reports which the .so matches.
 
-The UPSTREAM op only implements a CAUSAL window-127. But dspark_attention.py passes the DSV4
-NON-CAUSAL asymmetric window:  _dspark_sas_window(block=7, win=128) -> win_left=134, win_right=6.
-So if the .so built on this node is the upstream (or an incomplete fork) op, it computes causal-127
-instead of non-causal-134/6 -> wrong result -> the observed maxAbs~1.39. (If it were merely a dtype/
-numeric bug, PROD would still track REF within ~1e-2; a 1.39 gap is a DIFFERENT MASK.)
+Run at BS=5 (DSV4 inference block, win 132/4), not BS=7 (Qwen3 block7). Also just check the built
+source directly:  grep -n 'oriWinRight_' <built csrc>/sparse_attn_sharedkv_tiling.cpp
+  ->  '< 0'  = you built the fork (non-causal, correct)
+  ->  '!= 0' = you built upstream (causal) -> rebuild from the dspark-dsv4 branch.
 
 WHAT THIS DOES
 --------------
@@ -26,16 +32,15 @@ masking on absolute token positions (unambiguous — no guessing the op's intern
   * REF_causal    : keep key kp for query qp if  qp-127 <= kp <= qp+0   (the upstream causal window)
 Then compares the compiled op (PROD) to each. The one PROD matches tells you what the op computes.
 
-VERDICT
+VERDICT (run at the DSV4 block; win_left/win_right come from _dspark_sas_window(BS, WIN))
 -------
-- PROD ~= REF_noncausal (and >> REF_causal): the op is CORRECT; the parity failure was something else.
-- PROD ~= REF_causal    (and >> REF_noncausal): CONFIRMED — the built op computes the CAUSAL 127/0
-  window. The fork's non-causal (win_right>0) kernel patch is NOT in this build. Rebuild vllm-ascend
-  from the dspark-dsv4 branch commit that adds win_right support (the same one that relaxed the
-  oriWinLeft==127 / oriWinRight==0 tiling asserts), or diff this node's csrc against the old node's.
-- PROD matches NEITHER: a numeric/build-corruption bug, not a window-semantics bug.
+- PROD ~= REF_noncausal (and >> REF_causal): the op is CORRECT (built from the fork). Expected result.
+- PROD ~= REF_causal    (and >> REF_noncausal): this NODE built the UPSTREAM causal op. Rebuild
+  vllm-ascend from the dspark-dsv4 branch whose sparse_attn_sharedkv_tiling.cpp:1365-1369 reads `< 0`.
+- PROD matches NEITHER: not a window issue — a numeric/build-corruption artifact (or, if you skipped
+  the harness fix, still the per-head-K scenario bug).
 
-NOTE: our Triton kernel implements the true non-causal 134/6 window and matches REF_noncausal at fp32
+NOTE: our Triton kernel implements the true non-causal window and matches REF_noncausal at fp32
 (5.96e-7), so this is purely a production-op build question, not a question about our kernel.
 
 RUN (A3 NPU, env dspark-dsv4-*, vllm_ascend with the SAS op built):
