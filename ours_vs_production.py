@@ -149,6 +149,38 @@ def ours(qb, kvl, sink):
     return o.transpose(1, 2).reshape(NBLK * BS, H, D)                 # [n,H,D] like the entry
 
 
+def prod_paged(qb, kvl, sink):
+    """PROD via the REAL serve convention: PA_ND paged (ori_kv=[pages, page_sz, 1, D] + ori_block_table
+    + seqused_kv), per draft block. This is the path dsa_v1.py uses (-> AL 3.94); the impl-A TND entry
+    (`run_entry`) is broken for KV>128 (NaN) — see probe_kv_path.py / AUDIT §6.1. qb [NBLK,BS,H,D],
+    kvl [NBLK,KV,D]."""
+    metadata_op, attn_op = dsa._get_dspark_sas_ops(qb)               # noqa: SLF001
+    _, wl, wr = _dspark_sas_window(BS, WIN)                           # win_left=WIN+BS-1, win_right=BS-1
+    page = 128
+    npages = (KV + page - 1) // page
+    sinks = sink[:H].float().contiguous()
+    cu_q = torch.tensor([0, BS], dtype=torch.int32, device=DEV)
+    cu_kv = torch.tensor([0, KV], dtype=torch.int32, device=DEV)
+    seqused_kv = torch.tensor([KV], dtype=torch.int32, device=DEV)
+    block_table = torch.arange(npages, dtype=torch.int32, device=DEV).view(1, npages)
+    outs = []
+    for b in range(NBLK):
+        ori_kv = torch.zeros(npages, page, 1, D, device=DEV, dtype=DT)
+        ori_kv.view(npages * page, 1, D)[:KV] = kvl[b].unsqueeze(1)
+        meta = metadata_op(num_heads_q=H, num_heads_kv=1, head_dim=D, cu_seqlens_q=cu_q,
+                           cu_seqlens_ori_kv=cu_kv, cu_seqlens_cmp_kv=None, seqused_q=None,
+                           seqused_kv=seqused_kv, batch_size=1, max_seqlen_q=BS, max_seqlen_kv=KV,
+                           cmp_ratio=1, ori_mask_mode=4, cmp_mask_mode=3, ori_win_left=wl, ori_win_right=wr,
+                           layout_q="TND", layout_kv="PA_ND", has_ori_kv=True, has_cmp_kv=False,
+                           device=str(DEV))
+        o = attn_op(qb[b].contiguous(), ori_kv=ori_kv, ori_block_table=block_table, cu_seqlens_q=cu_q,
+                    seqused_kv=seqused_kv, sinks=sinks, metadata=meta, softmax_scale=SCALE, cmp_ratio=1,
+                    ori_mask_mode=4, cmp_mask_mode=3, ori_win_left=wl, ori_win_right=wr,
+                    layout_q="TND", layout_kv="PA_ND")[0]            # [BS, H, D]
+        outs.append(o)
+    return torch.stack(outs, dim=0).reshape(NBLK * BS, H, D)         # [n, H, D]
+
+
 def cmp(x, ref):
     x, ref = x.float(), ref.float(); d = (x - ref).abs()
     return (bool(torch.allclose(x, ref, atol=ATOL, rtol=RTOL)), d.max().item(),
@@ -196,9 +228,15 @@ def main():
               "'npu_sparse_attn_sharedkv'))\"")
         return
 
-    # SAS op present -> real production comparison.
-    with _override(_get_dspark_attention_custom_op=lambda q: None):
-        fused = run_entry(s)
+    # SAS op present -> real production comparison via the PA_ND path (the convention dsa_v1.py serves
+    # with). NOTE: the impl-A TND entry (`run_entry`) is BROKEN for KV>128 (NaN) — see AUDIT §6.1 — so
+    # we deliberately do NOT use it for the prod baseline.
+    try:
+        fused = prod_paged(qb, kvl, sink)
+    except Exception as e:  # noqa: BLE001
+        print(f"[parity]  PA_ND prod call FAILED: {type(e).__name__}: {str(e)[:140]}")
+        print("   (paged setup may need tuning for this shape; the B=1 probe_kv_path.py PA_ND path works.)")
+        return
     torch.npu.synchronize()
     prod_ok = None
     for name, a, b in (("OURS vs PROD", ours_o, fused), ("PROD vs REF ", fused, ref)):
@@ -207,21 +245,20 @@ def main():
         if name.startswith("PROD vs REF"):
             prod_ok = c
     print()
-    tp = time_ms(lambda: run_entry(s))
+    tp = time_ms(lambda: prod_paged(qb, kvl, sink))
     to = time_ms(lambda: ours(qb, kvl, sink))
-    print(f"[fwd speed]  production={tp:7.3f}ms   ours={to:7.3f}ms   ratio {tp / to:4.2f}x")
-    print(">>> NOTE: the 'production' time is the vllm_ascend ENTRY = a per-block PYTHON loop calling "
-          "the op once per block (dispatch-bound), NOT the op's fused compute. It is NOT a fair "
-          "kernel-vs-kernel number; treat it as integration overhead, not op throughput.")
+    print(f"[fwd speed]  production(PA_ND)={tp:7.3f}ms   ours={to:7.3f}ms   ratio {tp / to:4.2f}x")
+    print(">>> NOTE: 'production' time is a per-block PYTHON loop of PA_ND op calls (dispatch-bound), "
+          "NOT the op's fused batched compute. Treat as integration overhead, not op throughput.")
     # Honest verdict keyed on the ACTUAL result (OURS is the trusted side: it matches REF above).
     if prod_ok:
-        print("\n>>> PROD matches REF and OURS -> the production op is correct here; our kernel is "
-              "equivalent (and see the speed note).")
+        print("\n>>> PROD (PA_ND, the real serve path) matches REF and OURS -> the production op is CORRECT "
+              "and our Triton kernel is equivalent to it. (bf16 maxAbs ~4e-3 = the bf16 output floor.)")
     else:
-        print("\n>>> PROD does NOT match REF, but OURS DOES (see 'OURS vs REF' above) -> the discrepancy "
-              "is in the COMPILED OP on this node, not our kernel and not the scenario. This is not "
-              "bf16 (our bf16 kernel matches REF) nor the window (see diag_sas_window.py). Verify the "
-              "build: grep -n 'oriWinRight_' <built csrc>/attention/sparse_attn_sharedkv/op_host/"
+        print("\n>>> PROD (PA_ND) does NOT match REF -> unexpected: the PA_ND path was correct at B=1 "
+              "(probe_kv_path.py). Suspect the batched paging setup here; check block_table / seqused_kv. "
+              "(If OURS vs REF still passes above, our kernel is unaffected.) Old note (TND path): grep -n "
+              "'oriWinRight_' <built csrc>/attention/sparse_attn_sharedkv/op_host/"
               "sparse_attn_sharedkv_tiling.cpp  (<0 = fork/non-causal; !=0 = upstream), and diff this "
               "node's csrc against the known-good node before trusting a prod-vs-ours speed number.")
 
