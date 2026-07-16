@@ -1,49 +1,59 @@
 #!/usr/bin/env python3
-"""3-way benchmark at the REAL DSV4 shape (KV=133): eager (bf16 REF) vs the PA_ND fused op (bf16) vs
-OUR Triton kernel (bf16). For each: PRECISION (vs an fp32 gold), forward SPEED (ms), peak MEMORY (MB).
+"""Multi-way benchmark at the REAL DSV4 shape (KV=133): precision / speed / peak-memory of
+  * PR eager   : vllm_ascend `_dspark_attention_reference` (the OP's own gold, what inference references)
+  * our eager  : `eager_reference.dspark_block_attention_ref` (the TRAINING-side gold our kernel targets)
+  * PROD PA_ND : the compiled op `npu_sparse_attn_sharedkv` via the REAL serve convention (PA_ND paged +
+                 seqused_kv + ori_block_table), per block. (The impl-A TND path NaNs at KV>128 — AUDIT §6.1.)
+  * OURS       : our fused Triton kernel.
+all in bf16, precision vs an FP32 gold. FIRST it checks the two eagers agree (training≡inference math),
+then it benches everyone.
 
-- gold        : dense sliding-window + per-head sink attention, computed in FP32 (the precision anchor).
-- eager (REF) : the same math in bf16 (materialises the [.,.,H,KV] scores) — the pure-torch baseline.
-- PROD PA_ND  : the compiled op npu_sparse_attn_sharedkv via the REAL serve convention (PA_ND paged +
-                seqused_kv + ori_block_table), per draft block. (The impl-A TND path NaNs at KV>128 —
-                see AUDIT §6.1 — so we use PA_ND, which matches at the bf16 floor.)
-- OURS        : our fused Triton kernel.
-
-bf16 vs the fp32 gold cannot beat ~4e-3 maxAbs (bf16 has an 8-bit mantissa AND the output is bf16),
+bf16 vs the fp32 gold cannot beat ~4e-3 maxAbs (bf16 = 8-bit mantissa AND the output is bf16-stored);
 so ~4e-3 maxAbs / ~1e-4 meanAbs / ~1% meanRel is the bf16 FLOOR = "as correct as bf16 gets".
 
 RUN (A3):  python bench_3way.py
            DTYPE=float16 python bench_3way.py     # floor tightens ~8x (proves it's dtype, not logic)
-           NBLK=256 python bench_3way.py
 """
 import os
 import time
 
 import torch
 
-# reuse the scenario + our kernel + the PA_ND prod call from ours_vs_production (its import also loads
-# the SAS op and reads H/D/WIN/BS/NBLK/DT from env)
 from ours_vs_production import (BS, D, DEV, DT, H, KV, NBLK, SCALE, WIN, build_scenario, ours, prod_paged)
+from vllm_ascend.ops.dspark_attention import _dspark_attention_reference as _pr_ref  # PR eager gold
+from eager_reference import dspark_block_attention_ref as _our_ref                    # our training eager
 
 NITER = int(os.environ.get("NITER", "20"))
 
 
 def dense_attn(qb, kvl, sink, dtype):
-    """Dense [ctx|block] attention + per-head sink over the SHARED latent (MLA — no per-head K expand),
-    computed in `dtype`. qb [NBLK,BS,H,D], kvl [NBLK,KV,D]."""
-    q = qb.to(dtype)                                                # [NBLK,BS,H,D]
-    k = kvl.to(dtype)                                               # [NBLK,KV,D] shared across heads
-    scores = torch.einsum("nqhd,nkd->nqhk", q, k).to(torch.float32) * SCALE   # [NBLK,BS,H,KV]
+    """fp32/dtype dense [ctx|block] + per-head sink over the SHARED latent (MLA, no per-head expand)."""
+    q = qb.to(dtype); k = kvl.to(dtype)                            # [NBLK,BS,H,D], [NBLK,KV,D]
+    scores = torch.einsum("nqhd,nkd->nqhk", q, k).to(torch.float32) * SCALE
     s = sink[:H].float().view(1, 1, H, 1)
     m = torch.maximum(scores.max(dim=-1, keepdim=True).values, s)
     e = torch.exp(scores - m)
     p = (e / (e.sum(dim=-1, keepdim=True) + torch.exp(s - m))).to(dtype)
-    o = torch.einsum("nqhk,nkd->nqhd", p, k)                        # [NBLK,BS,H,D]
-    return o.reshape(NBLK * BS, H, D).to(qb.dtype)
+    return torch.einsum("nqhk,nkd->nqhd", p, k).reshape(NBLK * BS, H, D).to(qb.dtype)
 
 
-def cmp(x, gold):
-    x, g = x.float(), gold.float(); d = (x - g).abs()
+def pr_eager(qb, kvl, sink):
+    """PR's `_dspark_attention_reference` (per block; it casts to fp32 internally, bf16 inputs)."""
+    outs = []
+    for b in range(NBLK):
+        kb = kvl[b].unsqueeze(1).expand(KV, H, D).contiguous()     # [KV,H,D] shared latent -> per head
+        outs.append(_pr_ref(qb[b], kb, kb, sink, SCALE))           # [BS,H,D]
+    return torch.stack(outs, dim=0).reshape(NBLK * BS, H, D)
+
+
+def our_eager(qb, kvl, sink):
+    """Our training-side `dspark_block_attention_ref` (fp32 compute, bf16 inputs — as training uses it)."""
+    k = kvl.unsqueeze(2).expand(NBLK, KV, H, D).contiguous()       # [NBLK,KV,H,D]
+    return _our_ref(qb, k, k, sink[:H], SCALE, torch.float32).reshape(NBLK * BS, H, D)
+
+
+def cmp(x, g):
+    x, g = x.float(), g.float(); d = (x - g).abs()
     return d.max().item(), d.mean().item(), (d / (g.abs() + 1e-6)).mean().item()
 
 
@@ -65,35 +75,43 @@ def peak_mb(fn):
 
 def main():
     s, qb, kvl, sink = build_scenario()
-    gold = dense_attn(qb, kvl, sink, torch.float32)                 # fp32 anchor
+    gold = dense_attn(qb, kvl, sink, torch.float32)
     torch.npu.synchronize()
-    print(f">>> 3-way bench   H={H} D={D} WIN={WIN} block={BS} KV={KV} blocks={NBLK}  dtype={DT}")
-    print(f">>> precision vs fp32 gold; bf16 floor ~4e-3 maxAbs / ~1e-4 meanAbs / ~1% meanRel\n")
+    print(f">>> bench  H={H} D={D} WIN={WIN} block={BS} KV={KV} blocks={NBLK}  dtype={DT}")
+    print(">>> precision vs fp32 gold; bf16 floor ~4e-3 maxAbs / ~1e-4 meanAbs / ~1% meanRel\n")
+
+    # (0) do the two eager references agree? (training math == inference math)
+    try:
+        pe, oe = pr_eager(qb, kvl, sink), our_eager(qb, kvl, sink)
+        mx, ma, mr = cmp(pe, oe)
+        print(f"[agree]  PR eager vs our eager   maxAbs={mx:.2e}  meanAbs={ma:.2e}  meanRel={mr:.2e}  "
+              f"({'IDENTICAL math' if mx < 5e-2 else 'DIVERGE — investigate!'})\n")
+    except Exception as e:  # noqa: BLE001
+        print(f"[agree]  eager compare FAILED: {type(e).__name__}: {str(e)[:60]}\n")
 
     runners = {
-        "eager (bf16 REF)": lambda: dense_attn(qb, kvl, sink, DT),
-        "PROD PA_ND (op)":  lambda: prod_paged(qb, kvl, sink),
-        "OURS (Triton)":    lambda: ours(qb, kvl, sink),
+        "PR eager (dspark_ref)": lambda: pr_eager(qb, kvl, sink),
+        "our eager (train)":     lambda: our_eager(qb, kvl, sink),
+        "PROD PA_ND (op)":       lambda: prod_paged(qb, kvl, sink),
+        "OURS (Triton)":         lambda: ours(qb, kvl, sink),
     }
-
-    print(f"{'impl':18} | {'maxAbs':>9} {'meanAbs':>9} {'meanRel':>9} | {'fwd ms':>8} | {'peak MB':>8}")
-    print("-" * 74)
+    print(f"{'impl':22} | {'maxAbs':>9} {'meanAbs':>9} {'meanRel':>9} | {'fwd ms':>8} | {'peak MB':>8}")
+    print("-" * 80)
     for name, fn in runners.items():
         try:
             out = fn(); torch.npu.synchronize()
+            mx, ma, mr = cmp(out, gold)
+            t, mem = time_ms(fn), peak_mb(fn)
+            print(f"{name:22} | {mx:9.2e} {ma:9.2e} {mr:9.2e} | {t:8.3f} | {mem:8.1f}")
         except Exception as e:  # noqa: BLE001
-            print(f"{name:18} | FAILED: {type(e).__name__}: {str(e)[:40]}")
-            continue
-        mx, ma, mr = cmp(out, gold)
-        t = time_ms(fn)
-        mem = peak_mb(fn)
-        print(f"{name:18} | {mx:9.2e} {ma:9.2e} {mr:9.2e} | {t:8.3f} | {mem:8.1f}")
+            print(f"{name:22} | FAILED: {type(e).__name__}: {str(e)[:44]}")
 
-    print("\n>>> read: eager/PROD/OURS should all sit at the bf16 floor (precision) — that's 'equivalent'.")
-    print(">>> speed/mem: OURS = ONE fused batched kernel call; eager = ONE batched einsum (materialises")
-    print("    the [NBLK,BS,H,KV] scores -> more peak MB) -> OURS-vs-eager is the FAIR head-to-head.")
-    print(">>> PROD PA_ND time = a per-block PYTHON loop of op calls (dispatch-bound) -> integration")
-    print("    overhead, NOT the op's fused batched throughput; don't read it as op speed.")
+    print("\n>>> read:")
+    print("  - [agree] ~bf16 floor => training gold == inference gold (semantics consistent).")
+    print("  - precision: all 4 at the bf16 floor => equivalent/correct (fp16 tightens ~8x = dtype).")
+    print("  - speed/mem: OURS = ONE fused batched kernel; the eagers materialise scores/per-head K")
+    print("    (heavier MB). OURS-vs-'our eager' is the fair kernel-vs-baseline head-to-head.")
+    print("  - PROD PA_ND time = per-block PYTHON loop of op calls (dispatch-bound) -> NOT op throughput.")
 
 
 if __name__ == "__main__":
