@@ -149,36 +149,45 @@ def ours(qb, kvl, sink):
     return o.transpose(1, 2).reshape(NBLK * BS, H, D)                 # [n,H,D] like the entry
 
 
-def prod_paged(qb, kvl, sink):
-    """PROD via the REAL serve convention: PA_ND paged (ori_kv=[pages, page_sz, 1, D] + ori_block_table
-    + seqused_kv), per draft block. This is the path dsa_v1.py uses (-> AL 3.94); the impl-A TND entry
-    (`run_entry`) is broken for KV>128 (NaN) — see probe_kv_path.py / AUDIT §6.1. qb [NBLK,BS,H,D],
-    kvl [NBLK,KV,D]."""
+def prod_prep(qb, kvl, sink):
+    """Build the args for ONE BATCHED PA_ND op call over all NBLK draft blocks (B=NBLK) — the way the
+    real serve (dsa_v1.py) batches. Metadata is built here ONCE (the serve caches it per shape), so the
+    timed path (`prod_call`) is only the op's fused compute, a FAIR fused-op throughput number.
+    qb [NBLK,BS,H,D], kvl [NBLK,KV,D]."""
     metadata_op, attn_op = dsa._get_dspark_sas_ops(qb)               # noqa: SLF001
     _, wl, wr = _dspark_sas_window(BS, WIN)                           # win_left=WIN+BS-1, win_right=BS-1
     page = 128
-    npages = (KV + page - 1) // page
+    ppb = (KV + page - 1) // page                                    # pages per block (KV=133 -> 2)
+    q = qb.reshape(NBLK * BS, H, D).contiguous()                     # [n, H, D] TND, all blocks
+    cu_q = (torch.arange(NBLK + 1, dtype=torch.int32, device=DEV) * BS)   # prefix sum of BS
+    cu_kv = (torch.arange(NBLK + 1, dtype=torch.int32, device=DEV) * KV)
+    seqused_kv = torch.full((NBLK,), KV, dtype=torch.int32, device=DEV)   # actual KV len per block
+    # paged KV pool [NBLK*ppb, page, 1, D]; block b -> pages [b*ppb .. b*ppb+ppb-1], first KV slots valid
+    ori = torch.zeros(NBLK, ppb * page, 1, D, device=DEV, dtype=DT)
+    ori[:, :KV, 0, :] = kvl
+    ori_kv = ori.view(NBLK * ppb, page, 1, D)
+    block_table = torch.arange(NBLK * ppb, dtype=torch.int32, device=DEV).view(NBLK, ppb)
     sinks = sink[:H].float().contiguous()
-    cu_q = torch.tensor([0, BS], dtype=torch.int32, device=DEV)
-    cu_kv = torch.tensor([0, KV], dtype=torch.int32, device=DEV)
-    seqused_kv = torch.tensor([KV], dtype=torch.int32, device=DEV)
-    block_table = torch.arange(npages, dtype=torch.int32, device=DEV).view(1, npages)
-    outs = []
-    for b in range(NBLK):
-        ori_kv = torch.zeros(npages, page, 1, D, device=DEV, dtype=DT)
-        ori_kv.view(npages * page, 1, D)[:KV] = kvl[b].unsqueeze(1)
-        meta = metadata_op(num_heads_q=H, num_heads_kv=1, head_dim=D, cu_seqlens_q=cu_q,
-                           cu_seqlens_ori_kv=cu_kv, cu_seqlens_cmp_kv=None, seqused_q=None,
-                           seqused_kv=seqused_kv, batch_size=1, max_seqlen_q=BS, max_seqlen_kv=KV,
-                           cmp_ratio=1, ori_mask_mode=4, cmp_mask_mode=3, ori_win_left=wl, ori_win_right=wr,
-                           layout_q="TND", layout_kv="PA_ND", has_ori_kv=True, has_cmp_kv=False,
-                           device=str(DEV))
-        o = attn_op(qb[b].contiguous(), ori_kv=ori_kv, ori_block_table=block_table, cu_seqlens_q=cu_q,
-                    seqused_kv=seqused_kv, sinks=sinks, metadata=meta, softmax_scale=SCALE, cmp_ratio=1,
-                    ori_mask_mode=4, cmp_mask_mode=3, ori_win_left=wl, ori_win_right=wr,
-                    layout_q="TND", layout_kv="PA_ND")[0]            # [BS, H, D]
-        outs.append(o)
-    return torch.stack(outs, dim=0).reshape(NBLK * BS, H, D)         # [n, H, D]
+    meta = metadata_op(num_heads_q=H, num_heads_kv=1, head_dim=D, cu_seqlens_q=cu_q,
+                       cu_seqlens_ori_kv=cu_kv, cu_seqlens_cmp_kv=None, seqused_q=None,
+                       seqused_kv=seqused_kv, batch_size=NBLK, max_seqlen_q=BS, max_seqlen_kv=KV,
+                       cmp_ratio=1, ori_mask_mode=4, cmp_mask_mode=3, ori_win_left=wl, ori_win_right=wr,
+                       layout_q="TND", layout_kv="PA_ND", has_ori_kv=True, has_cmp_kv=False, device=str(DEV))
+    return dict(attn_op=attn_op, q=q, ori_kv=ori_kv, bt=block_table, cu_q=cu_q, seqused=seqused_kv,
+                sinks=sinks, meta=meta, wl=wl, wr=wr)
+
+
+def prod_call(a):
+    """The FAIR timed path: one batched PA_ND op call. Returns [n, H, D]."""
+    return a["attn_op"](a["q"], ori_kv=a["ori_kv"], ori_block_table=a["bt"], cu_seqlens_q=a["cu_q"],
+                        seqused_kv=a["seqused"], sinks=a["sinks"], metadata=a["meta"], softmax_scale=SCALE,
+                        cmp_ratio=1, ori_mask_mode=4, cmp_mask_mode=3, ori_win_left=a["wl"],
+                        ori_win_right=a["wr"], layout_q="TND", layout_kv="PA_ND")[0]
+
+
+def prod_paged(qb, kvl, sink):
+    """Correctness path: prep + one batched PA_ND op call."""
+    return prod_call(prod_prep(qb, kvl, sink))
 
 
 def cmp(x, ref):
@@ -245,11 +254,12 @@ def main():
         if name.startswith("PROD vs REF"):
             prod_ok = c
     print()
-    tp = time_ms(lambda: prod_paged(qb, kvl, sink))
+    prep = prod_prep(qb, kvl, sink)                                  # metadata built once (serve caches it)
+    tp = time_ms(lambda: prod_call(prep))                            # time ONLY the batched op call
     to = time_ms(lambda: ours(qb, kvl, sink))
-    print(f"[fwd speed]  production(PA_ND)={tp:7.3f}ms   ours={to:7.3f}ms   ratio {tp / to:4.2f}x")
-    print(">>> NOTE: 'production' time is a per-block PYTHON loop of PA_ND op calls (dispatch-bound), "
-          "NOT the op's fused batched compute. Treat as integration overhead, not op throughput.")
+    print(f"[fwd speed]  production(PA_ND op)={tp:7.3f}ms   ours={to:7.3f}ms   speedup {tp / to:4.2f}x")
+    print(">>> production = ONE batched PA_ND op call (the real vllm-ascend baseline — the engine always "
+          "calls this op; eager is never reached by any flag). Fair op-vs-op; both forward-only.")
     # Honest verdict keyed on the ACTUAL result (OURS is the trusted side: it matches REF above).
     if prod_ok:
         print("\n>>> PROD (PA_ND, the real serve path) matches REF and OURS -> the production op is CORRECT "

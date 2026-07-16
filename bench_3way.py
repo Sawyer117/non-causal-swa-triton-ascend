@@ -19,7 +19,8 @@ import time
 
 import torch
 
-from ours_vs_production import (BS, D, DEV, DT, H, KV, NBLK, SCALE, WIN, build_scenario, ours, prod_paged)
+from ours_vs_production import (BS, D, DEV, DT, H, KV, NBLK, SCALE, WIN, build_scenario, ours, prod_call,
+                                prod_paged, prod_prep)
 from vllm_ascend.ops.dspark_attention import _dspark_attention_reference as _pr_ref  # PR eager gold
 from eager_reference import dspark_block_attention_ref as _our_ref                    # our training eager
 
@@ -89,29 +90,42 @@ def main():
     except Exception as e:  # noqa: BLE001
         print(f"[agree]  eager compare FAILED: {type(e).__name__}: {str(e)[:60]}\n")
 
-    runners = {
-        "PR eager (dspark_ref)": lambda: pr_eager(qb, kvl, sink),
-        "our eager (train)":     lambda: our_eager(qb, kvl, sink),
-        "PROD PA_ND (op)":       lambda: prod_paged(qb, kvl, sink),
-        "OURS (Triton)":         lambda: ours(qb, kvl, sink),
-    }
+    # PROD is the BASELINE (the op the vllm-ascend engine actually calls). Prep once (serve caches the
+    # metadata) so the timed path is only the batched op's fused compute — a fair op-vs-op number.
+    prep = None
+    try:
+        prep = prod_prep(qb, kvl, sink)
+    except Exception as e:  # noqa: BLE001
+        print(f"[PROD prep FAILED: {type(e).__name__}: {str(e)[:60]}]")
+    runners = [
+        ("PROD PA_ND (BASELINE)", lambda: prod_call(prep) if prep else prod_paged(qb, kvl, sink), True),
+        ("OURS (Triton)",         lambda: ours(qb, kvl, sink), True),
+        ("our eager (correctref)", lambda: our_eager(qb, kvl, sink), False),
+        ("PR eager (correctref)",  lambda: pr_eager(qb, kvl, sink), False),
+    ]
     print(f"{'impl':22} | {'maxAbs':>9} {'meanAbs':>9} {'meanRel':>9} | {'fwd ms':>8} | {'peak MB':>8}")
     print("-" * 80)
-    for name, fn in runners.items():
+    prod_ms = None
+    for name, fn, is_contestant in runners:
         try:
             out = fn(); torch.npu.synchronize()
             mx, ma, mr = cmp(out, gold)
             t, mem = time_ms(fn), peak_mb(fn)
             print(f"{name:22} | {mx:9.2e} {ma:9.2e} {mr:9.2e} | {t:8.3f} | {mem:8.1f}")
+            if name.startswith("PROD"):
+                prod_ms = t
+            elif name.startswith("OURS") and prod_ms:
+                print(f"{'  -> OURS vs BASELINE':22} | {'':>9} {'':>9} {'':>9} | "
+                      f"{prod_ms / t:6.2f}x faster")
         except Exception as e:  # noqa: BLE001
             print(f"{name:22} | FAILED: {type(e).__name__}: {str(e)[:44]}")
 
     print("\n>>> read:")
-    print("  - [agree] ~bf16 floor => training gold == inference gold (semantics consistent).")
-    print("  - precision: all 4 at the bf16 floor => equivalent/correct (fp16 tightens ~8x = dtype).")
-    print("  - speed/mem: OURS = ONE fused batched kernel; the eagers materialise scores/per-head K")
-    print("    (heavier MB). OURS-vs-'our eager' is the fair kernel-vs-baseline head-to-head.")
-    print("  - PROD PA_ND time = per-block PYTHON loop of op calls (dispatch-bound) -> NOT op throughput.")
+    print("  - BASELINE = the PA_ND fused op (what the vllm-ascend engine actually calls; eager is never")
+    print("    reached by any flag). OURS vs PROD is the real op-vs-op comparison (both forward-only).")
+    print("  - [agree] + the two 'correctref' eagers just confirm CORRECTNESS (training gold == inference")
+    print("    gold, and everyone sits at the bf16 floor). They are NOT the speed baseline.")
+    print("  - precision: PROD & OURS identical at the bf16 floor; fp16 tightens ~8x (=> dtype, not logic).")
 
 
 if __name__ == "__main__":
