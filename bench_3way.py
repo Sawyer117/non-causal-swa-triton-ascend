@@ -97,35 +97,39 @@ def main():
         prep = prod_prep(qb, kvl, sink)
     except Exception as e:  # noqa: BLE001
         print(f"[PROD prep FAILED: {type(e).__name__}: {str(e)[:60]}]")
+    # roles: prod op = INFERENCE ref (engine's op, no autograd -> training can't use it);
+    #        our training eager = the TRAINING baseline (has torch autograd); ours triton = our kernel.
     runners = [
-        ("PROD PA_ND (BASELINE)", lambda: prod_call(prep) if prep else prod_paged(qb, kvl, sink), True),
-        ("OURS (Triton)",         lambda: ours(qb, kvl, sink), True),
-        ("our eager (correctref)", lambda: our_eager(qb, kvl, sink), False),
-        ("PR eager (correctref)",  lambda: pr_eager(qb, kvl, sink), False),
+        ("prod op (infer ref)",     lambda: prod_call(prep) if prep else prod_paged(qb, kvl, sink)),
+        ("our train eager (BASE)",  lambda: our_eager(qb, kvl, sink)),
+        ("ours triton",             lambda: ours(qb, kvl, sink)),
+        ("PR eager (gold check)",   lambda: pr_eager(qb, kvl, sink)),
     ]
     print(f"{'impl':22} | {'maxAbs':>9} {'meanAbs':>9} {'meanRel':>9} | {'fwd ms':>8} | {'peak MB':>8}")
     print("-" * 80)
-    prod_ms = None
-    for name, fn, is_contestant in runners:
+    times = {}
+    for name, fn in runners:
         try:
             out = fn(); torch.npu.synchronize()
             mx, ma, mr = cmp(out, gold)
             t, mem = time_ms(fn), peak_mb(fn)
+            times[name] = (t, mem)
             print(f"{name:22} | {mx:9.2e} {ma:9.2e} {mr:9.2e} | {t:8.3f} | {mem:8.1f}")
-            if name.startswith("PROD"):
-                prod_ms = t
-            elif name.startswith("OURS") and prod_ms:
-                print(f"{'  -> OURS vs BASELINE':22} | {'':>9} {'':>9} {'':>9} | "
-                      f"{prod_ms / t:6.2f}x faster")
         except Exception as e:  # noqa: BLE001
             print(f"{name:22} | FAILED: {type(e).__name__}: {str(e)[:44]}")
 
-    print("\n>>> read:")
-    print("  - BASELINE = the PA_ND fused op (what the vllm-ascend engine actually calls; eager is never")
-    print("    reached by any flag). OURS vs PROD is the real op-vs-op comparison (both forward-only).")
-    print("  - [agree] + the two 'correctref' eagers just confirm CORRECTNESS (training gold == inference")
-    print("    gold, and everyone sits at the bf16 floor). They are NOT the speed baseline.")
-    print("  - precision: PROD & OURS identical at the bf16 floor; fp16 tightens ~8x (=> dtype, not logic).")
+    tr = times.get("ours triton")
+    if tr:
+        if times.get("our train eager (BASE)"):
+            et, em = times["our train eager (BASE)"]
+            print(f"\n>>> TRAINING (our deliverable): ours triton FWD vs the training baseline (eager) = "
+                  f"{et / tr[0]:.2f}x faster, {em - tr[1]:+.0f} MB. NOTE: forward only — the training win "
+                  f"needs the fwd+BWD number (bwd is the weak part); run fused_sas_vs_ours.py.")
+        if times.get("prod op (infer ref)"):
+            pt, _ = times["prod op (infer ref)"]
+            print(f">>> INFERENCE ref: the engine's fused op fwd = {tr[0] / pt:.2f}x faster than ours "
+                  f"(hand-tuned AscendC; it has NO autograd so training can't use it).")
+    print(">>> precision: all sit at the bf16 floor (ours triton ≡ prod op ≡ eagers); fp16 tightens ~8x.")
 
 
 if __name__ == "__main__":
