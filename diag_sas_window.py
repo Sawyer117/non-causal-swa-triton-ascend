@@ -185,6 +185,21 @@ def main():
     per_pos = d.mean(dim=tuple(range(2, d.dim()))).mean(dim=0)   # [BS] mean|err| per within-block pos
     print("    per-block-position mean|PROD-ref_nc| (pos 0 sees the MOST future block tokens):")
     print("      " + "  ".join(f"p{i}={per_pos[i].item():.2e}" for i in range(BS)))
+
+    # Per-HEAD breakdown + correlation with the sink magnitude. prod is [N, H, D]. If the error is
+    # concentrated on the heads with large/near-max sink, the SINK handling is the culprit; if it is
+    # flat across heads (uncorrelated with sink), the sink is not it.
+    dh = (prod.float() - ref_nc.float()).abs()                  # [N,H,D]
+    per_head = dh.mean(dim=(0, 2))                              # [H] mean|err| per head
+    sinks = s["attn_sink"][: prod.shape[1]].float()            # [H]
+    order = torch.argsort(per_head, descending=True)
+    print("    worst 6 heads by mean|err|  (head: err, sink):")
+    print("      " + "  ".join(f"h{int(h)}:{per_head[h].item():.2e}(s={sinks[h].item():+.2f})"
+                               for h in order[:6]))
+    # rank-correlation-ish: does |err| track |sink| or (sink - typical_score)? report both means.
+    hi = per_head > per_head.median()
+    print(f"    mean sink |above-median-err heads|={sinks[hi].abs().mean().item():.2f}  "
+          f"|below|={sinks[~hi].abs().mean().item():.2f}  (differ a lot => sink-correlated)")
     print()
 
     d_nc, d_ca, d_ncb = r_nc["maxAbs"], r_ca["maxAbs"], r_ncb["maxAbs"]

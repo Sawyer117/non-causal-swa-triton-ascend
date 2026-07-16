@@ -92,6 +92,11 @@ def build_scenario():
     n = NBLK * BS
     q = torch.randn(n, H, D, device=DEV, dtype=DT)
     attn_sink = torch.randn(H, device=DEV, dtype=DT)
+    if os.environ.get("NOSINK", "0") == "1":
+        # DECISIVE sink-isolation: a very negative sink makes exp(sink-max)->0 in BOTH the op and the
+        # reference, i.e. plain softmax with NO sink term. If PROD vs REF collapses to ~OURS-vs-REF
+        # here, the entire discrepancy is the op's SINK handling; if it persists, it's the non-sink path.
+        attn_sink = torch.full((H,), -1e4, device=DEV, dtype=DT)
     # ONE latent per (token), broadcast to all H heads -> MLA (num_kv_heads=1)
     draft_k1 = torch.randn(n, 1, D, device=DEV, dtype=DT)
     draft_k = draft_k1.expand(n, H, D).contiguous()
